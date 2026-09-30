@@ -42,6 +42,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     private Task? _continuationTask;
     private TaskCompletionSource? _choiceBegun;
     private int _choiceOrdinal;
+    private PendingAnchor? _pendingAnchor;
     private ResetRequest? _reset;
     private readonly List<string> _history = [];
     private string? _currentBranchHandle;
@@ -250,6 +251,16 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         // action never contaminates the branch edge recorded by GetOrAddCurrentBranch().
         LegalAction action = BuildActions().SingleOrDefault(x => x.ActionId == actionId)
             ?? throw new ProtocolException("invalid_action", $"Action '{actionId}' is not legal in state {_hash}.");
+        // XuShuxi: Capture only an ordinary mechanical anchor. A pending
+        // continuation is never serialized; restore recreates it with one action.
+        bool certifiedTrigger = action.Kind == "play_card" && _cardInstanceIds.Keys
+            .Any(card => card is not null && Entry(card) == "PREPARED"
+                && GetCardInstanceId(card) == Convert.ToString(action.Parameters["instance_id"]));
+        CombatSnapshot? ordinaryAnchor = _pendingChoice is null && certifiedTrigger ? CaptureCombatSnapshot() : null;
+        PendingAnchor? anchor = ordinaryAnchor is null ? null
+            : new(ordinaryAnchor, _choiceOrdinal, actionId, _history.ToArray());
+        PendingAnchor? resolvedAnchor = _pendingAnchor;
+        _pendingAnchor = null;
         _lastActionId = actionId;
         if (action.Kind == "play_card")
             await StartTransitionAsync(() => PlayAsync(Convert.ToUInt32(action.Parameters["card_id"]), action.Parameters["target_id"] is null ? null : Convert.ToUInt32(action.Parameters["target_id"])));
@@ -281,6 +292,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         else if (action.Kind == "choose_custom_reward") await ChooseCustomRewardAsync(Convert.ToInt32(action.Parameters["reward_index"]), Convert.ToInt32(action.Parameters["child_index"]), Convert.ToInt32(action.Parameters["option_index"]));
         else if (action.Kind == "skip_custom_rewards") await SkipCustomRewardsAsync();
         else throw new ProtocolException("unsupported_action", action.Kind);
+        if (_pendingChoice is not null && anchor is not null) _pendingAnchor = anchor;
         if (record) _history.Add(actionId);
         timer.Stop();
         // Capture consumes _lastActionId as the transition edge label.  Clear it
@@ -288,7 +300,17 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         // replay the same edge and spawn a redundant child branch node.
         try
         {
-            return Capture(new { kind = action.Kind, action_id = actionId, elapsed_ms = timer.Elapsed.TotalMilliseconds, history_length = _history.Count });
+            EnvironmentResult result = Capture(new { kind = action.Kind, action_id = actionId, elapsed_ms = timer.Elapsed.TotalMilliseconds, history_length = _history.Count });
+            // XuShuxi: Only the bounded deterministic Prepared prefix certifies
+            // public DRAW order. Unknown effects publish null and fail closed.
+            PendingAnchor? evidenceAnchor = _pendingAnchor ?? resolvedAnchor;
+            if (evidenceAnchor is not null && IsPlainPreparedAnchor(evidenceAnchor))
+            {
+                object[]? events = _pendingAnchor is not null ? PreparedDrawEvidence(evidenceAnchor)
+                    : action.Kind == "choose_cards" && _pendingChoice is null ? [] : null;
+                result = result with { PublicCardEvents = events };
+            }
+            return result;
         }
         finally
         {
@@ -301,6 +323,26 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
     };
+
+    // XuShuxi: Generated evidence is derived from publicly visible hand results,
+    // not the pre-action hidden DrawPile order. No shuffle/hook is certified.
+    private static bool IsPlainPreparedAnchor(PendingAnchor anchor) =>
+        anchor.Snapshot.Relics.Count == 0 && anchor.Snapshot.PlayerPowers.Count == 0
+        && anchor.Snapshot.Enemies.All(enemy => enemy.Powers.Count == 0)
+        && anchor.Snapshot.Hand.Concat(anchor.Snapshot.DrawPile).Concat(anchor.Snapshot.DiscardPile)
+            .All(card => card.ModelId is "PREPARED" or "STRIKE_IRONCLAD" or "DEFEND_IRONCLAD");
+
+    private object[]? PreparedDrawEvidence(PendingAnchor anchor)
+    {
+        CombatSnapshot? mechanics = CaptureCombatSnapshot(pendingMechanicsOnly: true);
+        if (mechanics is null) return null;
+        var known = anchor.Snapshot.Hand.Select(card => card.InstanceId).ToHashSet();
+        var drawn = mechanics.Hand.Where(card => !known.Contains(card.InstanceId)).ToArray();
+        if (anchor.Snapshot.DrawPile.Count - mechanics.DrawPile.Count != drawn.Length) return null;
+        return drawn.Select((card, index) => (object)new { sequence = index, kind = "DRAW",
+            card = new { model_id = card.ModelId, upgrades = card.Upgrades, current_cost = card.EnergyCost, costs_x = card.CostsX },
+            source_zone = "DrawPile", pile_count_before = anchor.Snapshot.DrawPile.Count - index }).ToArray();
+    }
 
     public PortableCombatRoot ExportCombatRoot()
     {
@@ -540,11 +582,11 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     {
         ThrowIfPoisoned();
         EnsureReset();
-        if (!_branches.TryGetValue(request.StateHandle, out Branch? branch) || branch.CombatSnapshot is null)
+        if (!_branches.TryGetValue(request.StateHandle, out Branch? branch) || branch.MechanicsSnapshot is null)
             throw new ProtocolException("unsupported_monster_move_root", "A resident ordinary-combat root is required.");
-        CombatSnapshot before = CaptureCombatSnapshot()
+        CombatSnapshot before = CaptureCombatSnapshot(pendingMechanicsOnly: true)
             ?? throw new ProtocolException("unsupported_monster_move_root", "An ordinary combat snapshot is required.");
-        string sourceJson = JsonSerializer.Serialize(branch.CombatSnapshot, PortableRootJson);
+        string sourceJson = JsonSerializer.Serialize(branch.MechanicsSnapshot, PortableRootJson);
         if (JsonSerializer.Serialize(before, PortableRootJson) != sourceJson)
             throw new ProtocolException("monster_move_query_wrong_root", "The requested root is not current.");
         bool evaluate = request.Selections.Count != 0;
@@ -728,7 +770,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                     ReflectionTools.Set(move, "_performedAtLeastOnce", performed);
             }
             _suppressMonsterMoveEvents = oldSuppression;
-            CombatSnapshot after = CaptureCombatSnapshot()
+            CombatSnapshot after = CaptureCombatSnapshot(pendingMechanicsOnly: true)
                 ?? throw new ProtocolException("monster_move_query_mutated_root", "The query lost its combat snapshot.");
             if (JsonSerializer.Serialize(after, PortableRootJson) != sourceJson)
                 throw new ProtocolException("monster_move_query_mutated_root", "The query changed its resident root.");
@@ -747,7 +789,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             object creature = ReflectionTools.Get(__instance, "Creature")!;
             combatId = Convert.ToUInt32(ReflectionTools.Get(creature, "CombatId"));
             environment._monsterRollEvents.Add((++environment._monsterMoveEventSequence,
-                combatId, environment.CaptureCombatSnapshot(), null));
+                combatId, environment.CaptureCombatSnapshot(pendingMechanicsOnly: true), null));
         }
         catch (Exception error)
         {
@@ -898,7 +940,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         if (request.EventIndex < 0 || request.EventIndex >= _monsterRollEvents.Count
             || _monsterRollEvents[request.EventIndex].snapshot is not CombatSnapshot rollSnapshot)
             throw new ProtocolException("unsupported_monster_roll_query", "The exact pre-roll context was not captured.");
-        CombatSnapshot current = CaptureCombatSnapshot()
+        CombatSnapshot current = CaptureCombatSnapshot(pendingMechanicsOnly: true)
             ?? throw new ProtocolException("unsupported_monster_roll_query", "Current combat snapshot is unavailable.");
         Dictionary<(uint combatId, string moveId), bool> performedBefore = CaptureMovePerformedFlags();
         string expectedJson = JsonSerializer.Serialize(current, PortableRootJson);
@@ -921,7 +963,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 throw new ProtocolException("monster_roll_query_restore_failed", _lastSnapshotDebug);
             RestoreMovePerformedFlags(performedBefore);
             _currentBranchHandle = previousHandle;
-            CombatSnapshot restored = CaptureCombatSnapshot()
+            CombatSnapshot restored = CaptureCombatSnapshot(pendingMechanicsOnly: true)
                 ?? throw new ProtocolException("monster_roll_query_restore_failed", "Current snapshot disappeared.");
             if (JsonSerializer.Serialize(restored, PortableRootJson) != expectedJson)
                 throw new ProtocolException("monster_roll_query_restore_failed", "Query changed the current decision root.");
@@ -976,7 +1018,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     {
         ThrowIfPoisoned();
         EnsureReset();
-        if (CaptureCombatSnapshot() is null)
+        if (CaptureCombatSnapshot(pendingMechanicsOnly: true) is null)
             throw new ProtocolException("unsupported_monster_rng_provenance", "An ordinary combat snapshot is required.");
         object runRng = ReflectionTools.Get(_run!, "Rng")!;
         return new
@@ -1094,6 +1136,23 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         }
         QuiesceOutstandingTransition();
         Stopwatch timer = Stopwatch.StartNew();
+        _pendingAnchor = null;
+        if (branch.PendingAnchor is { } anchor)
+        {
+            // XuShuxi: Exact pre-action restore plus one native action creates a
+            // fresh local continuation. History is metadata, never re-executed.
+            _reset = branch.Reset;
+            if (!RestoreCombatSnapshot(anchor.Snapshot))
+                throw new ProtocolException("pending_anchor_restore_failed", _lastSnapshotDebug);
+            _history.Clear(); _history.AddRange(anchor.History);
+            _currentBranchHandle = null; _choiceOrdinal = anchor.ChoiceOrdinal;
+            EnvironmentResult regenerated = await StepAsync(anchor.ActionId);
+            if (!StringComparer.Ordinal.Equals(regenerated.StateHash, branch.ExpectedHash))
+                throw new ProtocolException("pending_regeneration_mismatch", "One-action regeneration changed the pending boundary.");
+            timer.Stop();
+            return regenerated with { Transition = new { kind = "pending_regeneration", replayed_actions = 0,
+                regenerated_actions = 1, elapsed_ms = timer.Elapsed.TotalMilliseconds } };
+        }
 
         if (branch.CombatSnapshot is not null)
         {
@@ -1164,7 +1223,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         object unlock = ReflectionTools.Create(T("MegaCrit.Sts2.Core.Unlocks.UnlockState"), new List<string>(), List(T("MegaCrit.Sts2.Core.Models.ModelId"), []), 0);
         _player = playerType.GetMethods(BindingFlags.Public | BindingFlags.Static).Single(x => x.Name == "CreateForNewRun" && x.GetParameters().Length == 3).Invoke(null, [character, unlock, (ulong)1])!;
         _cardInstanceIds.Clear();
-        _choiceOrdinal = 0; _dynamicCardOrdinal = 0; _pendingChoice = null; _continuationTask = null;
+        _choiceOrdinal = 0; _dynamicCardOrdinal = 0; _pendingAnchor = null; _pendingChoice = null; _continuationTask = null;
         object deck = ReflectionTools.Get(_player, "Deck")!;
         if (!r.UseCharacterStartingLoadout) ReflectionTools.Invoke(deck, "Clear", true);
         Dictionary<string, object> deckVersions = new(StringComparer.Ordinal);
@@ -3285,7 +3344,12 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             // a pile, so leave generated options out of the persistent map here.
             return $"generated-{choiceId}-{index}-{Entry(card)}";
         }).ToArray();
-        object[] snapshots = cards.Select((card, index) => (object)new { option_id = optionIds[index], model_id = Entry(card) }).ToArray();
+        object[] snapshots = cards.Select((card, index) => (object)new {
+            option_id = optionIds[index], model_id = Entry(card),
+            upgrades = ReflectionTools.Get(card, "CurrentUpgradeLevel"),
+            current_cost = ReflectionTools.Invoke(ReflectionTools.Get(card, "EnergyCost")!, "GetResolved"),
+            costs_x = ReflectionTools.Get(ReflectionTools.Get(card, "EnergyCost")!, "CostsX")
+        }).ToArray();
         string provenance = string.Join(" > ", new StackTrace().GetFrames()
             .Select(frame => frame.GetMethod())
             .Where(candidate => candidate?.DeclaringType?.FullName?.StartsWith("MegaCrit.Sts2", StringComparison.Ordinal) == true)
@@ -3301,7 +3365,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 object typed = List(cardModel, selected);
                 completion.GetType().GetMethod("SetResult")!.Invoke(completion, [typed]);
             },
-            () => TryCancelCompletion(completion), provenance);
+            () => TryCancelCompletion(completion), provenance, ChoiceSemantics(provenance, max), provenance.Contains("<FromHand", StringComparison.Ordinal) || provenance.Contains("<FromChooseACardScreen", StringComparison.Ordinal));
         _choiceBegun?.TrySetResult();
         return ReflectionTools.Get(completion, "Task");
     }
@@ -3356,10 +3420,23 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         else await signal.ConfigureAwait(false);
     }
 
+    // XuShuxi: Only audited VIS1C selector paths grant semantic authority.
+    // Stack frames identify the native API family, never a serialized program.
+    private static string ChoiceSemantics(string provenance, int max)
+    {
+        bool hand = provenance.Contains("<FromHand", StringComparison.Ordinal);
+        bool grid = provenance.Contains("<FromCombatPile", StringComparison.Ordinal)
+            || provenance.Contains("<FromSimpleGrid", StringComparison.Ordinal)
+            || provenance.Contains("<FromDeck", StringComparison.Ordinal);
+        bool single = provenance.Contains("<FromChooseACardScreen", StringComparison.Ordinal);
+        if (!hand && !grid && !single) return "UNKNOWN";
+        return max <= 1 ? "SINGLE" : hand ? "ORDERED" : grid ? "SET_LIKE" : "UNKNOWN";
+    }
+
     private IReadOnlyList<LegalAction> BuildChoiceActions(PendingNativeChoice choice)
     {
         List<LegalAction> actions = [];
-        foreach (string[] selection in EnumerateSelections(choice.OptionIds, choice.MinSelect, choice.MaxSelect, 4096))
+        foreach (string[] selection in EnumerateSelections(choice.OptionIds, choice.MinSelect, choice.MaxSelect, 4096, choice.SelectionSemantics == "ORDERED"))
         {
             string suffix = selection.Length == 0 ? "skip" : string.Join('+', selection.Select(Uri.EscapeDataString));
             actions.Add(new($"{choice.ActionKind}:{choice.ChoiceId}:{suffix}", choice.ActionKind, new Dictionary<string, object?> { ["choice_id"] = choice.ChoiceId, ["option_ids"] = selection }));
@@ -3367,7 +3444,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         return actions;
     }
 
-    private static IEnumerable<string[]> EnumerateSelections(string[] options, int min, int max, int limit)
+    private static IEnumerable<string[]> EnumerateSelections(string[] options, int min, int max, int limit, bool ordered = false)
     {
         List<string[]> result = []; List<string> current = [];
         void Visit(int index)
@@ -3375,7 +3452,13 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             if (result.Count > limit) return;
             if (current.Count >= min && current.Count <= max) result.Add(current.ToArray());
             if (current.Count == max) return;
-            for (int i = index; i < options.Length; i++) { current.Add(options[i]); Visit(i + 1); current.RemoveAt(current.Count - 1); }
+            // XuShuxi: Ordered selection enumerates injective sequences; set-like
+            // selection retains ascending combinations. Never truncate silently.
+            for (int i = ordered ? 0 : index; i < options.Length; i++)
+            {
+                if (current.Contains(options[i])) continue;
+                current.Add(options[i]); Visit(ordered ? 0 : i + 1); current.RemoveAt(current.Count - 1);
+            }
         }
         Visit(0);
         if (result.Count > limit) throw new ProtocolException("choice_too_large", $"Native choice expands beyond {limit} legal combinations.");
@@ -3495,7 +3578,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             _customRewardMode,
             _customRewardKinds,
             _customRewardsLinked,
-            combatSnapshot);
+            combatSnapshot, _pendingChoice is null ? null : _pendingAnchor, _pendingChoice is null ? null : CaptureCombatSnapshot(pendingMechanicsOnly: true));
         _branchOrder.AddLast(id);
         _currentBranchHandle = id;
         while (_branches.Count > BranchCapacity && _branchOrder.First is { } oldest)
@@ -3664,11 +3747,11 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         return move;
     }
 
-    private CombatSnapshot? CaptureCombatSnapshot()
+    private CombatSnapshot? CaptureCombatSnapshot(bool pendingMechanicsOnly = false)
     {
         if (_runMode || _mapMode || _rewardMode || _restMode || _eventMode || _customRewardMode || _combat is null || _pcs is null || _player is null || _reset is null)
             return null;
-        if (_pendingChoice is not null)
+        if (_pendingChoice is not null && !pendingMechanicsOnly)
             return null;
 
         bool oldSuppression = _suppressMonsterMoveEvents;
@@ -4493,7 +4576,14 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         bool CustomRewardMode,
         string[] CustomRewardKinds,
         bool CustomRewardsLinked,
-        CombatSnapshot? CombatSnapshot = null);
+        CombatSnapshot? CombatSnapshot = null,
+        PendingAnchor? PendingAnchor = null,
+        CombatSnapshot? PendingMechanicsSnapshot = null)
+    {
+        // XuShuxi: Query-only state cannot be restored as a continuation.
+        public CombatSnapshot? MechanicsSnapshot => CombatSnapshot ?? PendingMechanicsSnapshot;
+    }
+    private sealed record PendingAnchor(CombatSnapshot Snapshot, int ChoiceOrdinal, string ActionId, string[] History);
     private sealed record PendingRewardSelection(object TopReward, object SelectedReward, Task OfferTask, bool IsLinked);
     private sealed class PendingNativeChoice(
         string choiceId,
@@ -4505,15 +4595,16 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         object[] optionSnapshots,
         Action<string[]> resolver,
         Action cancel,
-        string provenance = "")
+        string provenance = "", string selectionSemantics = "SINGLE", bool presentationOrdered = false)
     {
         public string ChoiceId { get; } = choiceId;
         public string DecisionKind { get; } = decisionKind;
         public string ActionKind { get; } = actionKind;
+        public string SelectionSemantics { get; } = selectionSemantics;
         public string[] OptionIds { get; } = optionIds;
         public int MinSelect { get; } = minSelect;
         public int MaxSelect { get; } = maxSelect;
-        public object Snapshot() => new { choice_id = ChoiceId, kind = ActionKind, min_select = MinSelect, max_select = MaxSelect, provenance, options = optionSnapshots };
+        public object Snapshot() => new { choice_id = ChoiceId, kind = ActionKind, min_select = MinSelect, max_select = MaxSelect, provenance, selection_semantics = SelectionSemantics, presentation_ordered = presentationOrdered, options = optionSnapshots };
         public void Resolve(string[] selectedIds) => resolver(selectedIds);
         public void Cancel() => cancel();
     }

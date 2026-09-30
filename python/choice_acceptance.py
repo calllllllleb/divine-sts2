@@ -61,7 +61,7 @@ def main():
         purity = worker.reset(PURITY_SCENARIO)
         purity_play = next(a["action_id"] for a in purity["legal_actions"] if a["parameters"].get("instance_id") == "purity-0")
         purity_choice = worker.step(purity_play)
-        assert len(purity_choice["legal_actions"]) == 8  # every subset of three cards, including skip
+        assert len(purity_choice["legal_actions"]) == 16  # ordered injective sequences of three cards, including skip
         purity_handle = purity_choice["state_handle"]
         skipped = worker.step(purity_choice["legal_actions"][0]["action_id"])
         worker.restore(purity_handle)

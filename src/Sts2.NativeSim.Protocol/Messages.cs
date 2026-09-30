@@ -120,4 +120,5 @@ public sealed record EnvironmentResult(
     [property: JsonPropertyName("victory")] bool Victory,
     [property: JsonPropertyName("state_handle")] string StateHandle,
     [property: JsonPropertyName("transition")] object? Transition = null,
-    [property: JsonPropertyName("scoring_features")] object? ScoringFeatures = null);
+    [property: JsonPropertyName("scoring_features")] object? ScoringFeatures = null,
+    [property: JsonPropertyName("public_card_events")] object[]? PublicCardEvents = null);
