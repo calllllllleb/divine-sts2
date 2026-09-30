@@ -790,7 +790,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         ImmediateRuleSnapshot? rule = ImmediateMoveRuleProof.FromStack(__instance, null);
         if (rule is null)
         {
-            if (ImmediateMoveRuleProof.StackCallerContainsImmediate(__instance))
+            if (ImmediateMoveRuleProof.StackCallerReadsImmediatePredicate(__instance))
             {
                 object creature = ReflectionTools.Get(__instance, "Creature")!;
                 environment._monsterTransientEvents.Add((++environment._monsterMoveEventSequence,

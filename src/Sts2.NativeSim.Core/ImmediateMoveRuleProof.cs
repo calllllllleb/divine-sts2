@@ -18,7 +18,15 @@ internal static class ImmediateMoveRuleProof
         .Select(field => (OpCode)field.GetValue(null)!)
         .ToDictionary(code => code.Value);
 
-    public static bool StackCallerContainsImmediate(object monster) => FindCaller(monster) is not null;
+    // XuShuxi: SetMoveImmediate itself reads NextMove. Only a read in the
+    // gameplay caller is a hidden predicate; public and transient installs
+    // are certified after execution, when the actual argument is available.
+    public static bool StackCallerReadsImmediatePredicate(object monster)
+    {
+        MethodInfo? caller = FindCaller(monster);
+        return caller is not null && Decode(caller)?.Any(instruction =>
+            instruction.Member is MethodInfo method && method.Name == "get_NextMove") == true;
+    }
 
     public static PersistentNativeCombatEnvironment.ImmediateRuleSnapshot? FromStack(
         object monster, object? destinationHint)
@@ -41,7 +49,7 @@ internal static class ImmediateMoveRuleProof
         if (nextReads.Count == 0)
         {
             if (destinationHint is null) return null;
-            string? destination = RegisteredId(monster, destinationHint);
+            string? destination = PublicRegisteredDestination(monster, destinationHint, code, setIndex);
             return destination is null ? null : new(CombatId(monster), destination, null, source);
         }
         if (nextReads.Count != 1 || nextReads[0] >= setIndex) return null;
@@ -91,6 +99,31 @@ internal static class ImmediateMoveRuleProof
         if (triggers.Length != 1) return null;
         if (!stateReads.Any(row => row.index > branchIndex && row.id == destinationId)) return null;
         return new(CombatId(monster), destinationId, triggers[0], source);
+    }
+
+    // XuShuxi: Recognize only the direct registered-property argument shape,
+    // not arbitrary callbacks or computed destinations. The getter must be a
+    // pure field read on this monster; its value must be the executed argument
+    // and a member of this monster's own FSM. Unknown IL continues to fail closed.
+    private static string? PublicRegisteredDestination(
+        object monster, object destination, List<Instruction> code, int setIndex)
+    {
+        if (setIndex < 3 || code[setIndex - 1].Code != OpCodes.Ldc_I4_0
+            && code[setIndex - 1].Code != OpCodes.Ldc_I4_1) return null;
+        Instruction producer = code[setIndex - 2];
+        if (producer.Code != OpCodes.Call && producer.Code != OpCodes.Callvirt) return null;
+        if (producer.Member is not MethodInfo getter || !getter.IsSpecialName
+            || !getter.Name.StartsWith("get_", StringComparison.Ordinal)
+            || getter.IsStatic || getter.GetParameters().Length != 0
+            || getter.ReturnType.Name != "MoveState" || getter.DeclaringType is null
+            || !getter.DeclaringType.IsAssignableFrom(monster.GetType())) return null;
+        List<Instruction>? body = Decode(getter);
+        if (body is not { Count: 3 } || body[0].Code != OpCodes.Ldarg_0
+            || body[1].Code != OpCodes.Ldfld || body[2].Code != OpCodes.Ret
+            || body[1].Member is not FieldInfo field || field.IsStatic
+            || field.FieldType != getter.ReturnType || field.DeclaringType is null
+            || !field.DeclaringType.IsAssignableFrom(monster.GetType())) return null;
+        return ReferenceEquals(field.GetValue(monster), destination) ? RegisteredId(monster, destination) : null;
     }
 
     private static MethodInfo? FindCaller(object monster)
