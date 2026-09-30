@@ -42,6 +42,13 @@ public sealed record ResetRequest(
     [property: JsonPropertyName("invoke_combat_entry_hooks")] bool InvokeCombatEntryHooks = false,
     [property: JsonPropertyName("capture_orbs")] bool CaptureOrbs = true,
     [property: JsonPropertyName("use_character_starting_loadout")] bool UseCharacterStartingLoadout = false);
+// XuShuxi: The private snapshot travels as JSON, never as a worker-local handle.
+public sealed record PortableCombatRoot(
+    [property: JsonPropertyName("schema_version")] int SchemaVersion,
+    [property: JsonPropertyName("game_build")] GameBuildSpec GameBuild,
+    [property: JsonPropertyName("base_reset")] ResetRequest BaseReset,
+    [property: JsonPropertyName("combat_snapshot")] JsonElement CombatSnapshot,
+    [property: JsonPropertyName("expected_state_hash")] string ExpectedStateHash);
 public sealed record StepRequest([property: JsonPropertyName("action_id")] string ActionId);
 public sealed record EventResetRequest(
     [property: JsonPropertyName("state")] ResetRequest State,
@@ -54,6 +61,55 @@ public sealed record CustomRewardResetRequest(
     [property: JsonPropertyName("state")] ResetRequest State,
     [property: JsonPropertyName("reward_kinds")] IReadOnlyList<string> RewardKinds,
     [property: JsonPropertyName("linked")] bool Linked = false);
+// XuShuxi: Constraints contain public card faces only; native identity fields are rejected.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record VisibleDrawCardConstraint(
+    [property: JsonPropertyName("model_id"), JsonRequired] string ModelId,
+    [property: JsonPropertyName("upgrades"), JsonRequired] int Upgrades,
+    [property: JsonPropertyName("current_cost"), JsonRequired] int? CurrentCost,
+    [property: JsonPropertyName("costs_x"), JsonRequired] bool? CostsX);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record DrawOrderConstraints(
+    [property: JsonPropertyName("known_draw_top"), JsonRequired] IReadOnlyList<VisibleDrawCardConstraint> KnownDrawTop,
+    [property: JsonPropertyName("known_draw_bottom"), JsonRequired] IReadOnlyList<VisibleDrawCardConstraint> KnownDrawBottom);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ResampleDrawOrderRequest(
+    [property: JsonPropertyName("state_handle"), JsonRequired] string StateHandle,
+    [property: JsonPropertyName("search_entropy"), JsonRequired] string SearchEntropy,
+    [property: JsonPropertyName("constraints"), JsonRequired] DrawOrderConstraints Constraints);
+// XuShuxi: Search entropy is independent of factual seeds/counters.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ForkFutureRngRequest(
+    [property: JsonPropertyName("state_handle"), JsonRequired] string StateHandle,
+    [property: JsonPropertyName("search_entropy"), JsonRequired] string SearchEntropy);
+// XuShuxi: Search supplies a complete public-history-derived move log, never a factual move answer.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record MonsterMoveSelection(
+    [property: JsonPropertyName("combat_id"), JsonRequired] uint CombatId,
+    [property: JsonPropertyName("state_log"), JsonRequired] IReadOnlyList<string> StateLog,
+    [property: JsonPropertyName("next_move_id"), JsonRequired] string NextMoveId,
+    [property: JsonPropertyName("performed_first_move"), JsonRequired] bool PerformedFirstMove,
+    [property: JsonPropertyName("transient_follow_up_state_id")] string? TransientFollowUpStateId = null);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ReconstructMonsterMovesRequest(
+    [property: JsonPropertyName("state_handle"), JsonRequired] string StateHandle,
+    [property: JsonPropertyName("selections"), JsonRequired] IReadOnlyList<MonsterMoveSelection> Selections);
+// XuShuxi: Empty selections request structure only; evaluated rules require a complete hypothetical world.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record DescribeMonsterMoveRulesRequest(
+    [property: JsonPropertyName("state_handle"), JsonRequired] string StateHandle,
+    [property: JsonPropertyName("selections"), JsonRequired] IReadOnlyList<MonsterMoveSelection> Selections);
+// XuShuxi: A roll event is a private timing token, not a factual move answer.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record DescribeMonsterRollRulesRequest(
+    [property: JsonPropertyName("state_handle"), JsonRequired] string StateHandle,
+    [property: JsonPropertyName("event_index"), JsonRequired] int EventIndex,
+    [property: JsonPropertyName("selections"), JsonRequired] IReadOnlyList<MonsterMoveSelection> Selections);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record DescribeMonsterImmediateRuleRequest(
+    [property: JsonPropertyName("state_handle"), JsonRequired] string StateHandle,
+    [property: JsonPropertyName("event_index"), JsonRequired] int EventIndex,
+    [property: JsonPropertyName("selections"), JsonRequired] IReadOnlyList<MonsterMoveSelection> Selections);
 public sealed record RestoreRequest([property: JsonPropertyName("state_handle")] string StateHandle);
 public sealed record LegalAction([property: JsonPropertyName("action_id")] string ActionId, [property: JsonPropertyName("kind")] string Kind, [property: JsonPropertyName("parameters")] IReadOnlyDictionary<string, object?> Parameters);
 public sealed record EnvironmentResult(

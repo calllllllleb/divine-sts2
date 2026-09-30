@@ -258,12 +258,27 @@ internal static class NativeTraceExporter
         object? move = monster is null ? null : GetMember(monster, "NextMove");
         object[] intents = move is null ? [] : Enumerate(GetMember(move, "Intents")).Select(x => IntentSnapshot(x, creature)).ToArray();
         object[] powers = Enumerate(GetMember(creature, "Powers"))
-            .Select(x => new { model_id = ModelEntry(x), amount = GetMember(x, "Amount") }).ToArray();
+            .Select(PowerObservationSnapshot).ToArray();
         return new
         {
             combat_id = creature.CombatId, model_id = creature.ModelId.Entry, side = creature.Side.ToString(),
             hp = creature.CurrentHp, max_hp = creature.MaxHp, block = creature.Block, alive = creature.IsAlive,
             next_move = move is null ? null : new { id = GetMember(move, "Id"), intents }, powers
+        };
+    }
+
+    private static object PowerObservationSnapshot(object power)
+    {
+        string stackType = GetMember(power, "StackType")?.ToString()
+            ?? throw new MissingMemberException(power.GetType().FullName, "StackType");
+        return new
+        {
+            model_id = ModelEntry(power),
+            amount = GetMember(power, "Amount"),
+            is_visible = Convert.ToBoolean(GetMember(power, "IsVisible")),
+            display_amount = StringComparer.Ordinal.Equals(stackType, "Counter")
+                ? Convert.ToInt32(GetMember(power, "DisplayAmount"))
+                : (int?)null
         };
     }
 

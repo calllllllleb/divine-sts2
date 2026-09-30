@@ -285,6 +285,102 @@ class NativeWorker:
         cap = int(os.environ.get("STS2_BRANCH_CAPACITY", "8192"))
         while len(self._handle_histories) > cap: self._handle_histories.popitem(last=False)
 
+    def fork_future_rng(self, state_handle: str, *, search_entropy: str) -> dict[str, Any]:
+        """Freeze materialized state and install an independent native future kernel."""
+        result = self.request("fork_future_rng", {"state_handle": state_handle, "search_entropy": search_entropy})
+        # XuShuxi: Preserve parent handles; the future root owns an empty local history.
+        self._history = []
+        self._remember_handle(result["state_handle"])
+        return result
+
+    def describe_monster_move_candidates(self) -> list[dict[str, Any]]:
+        """Enumerate candidate native moves and their current public intent projections."""
+        return self.request("describe_monster_move_candidates")
+
+    def describe_monster_move_rules(
+        self, state_handle: str, *, selections: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Query native FSM structure or evaluate it under a complete hypothetical world."""
+        return self.request("describe_monster_move_rules", {
+            "state_handle": state_handle, "selections": selections,
+        })
+
+    def describe_monster_roll_events(self) -> list[dict[str, Any]]:
+        """List native move-roll timing events without revealing their outcomes."""
+        return self.request("describe_monster_roll_events")
+
+    def describe_monster_transient_events(self) -> list[dict[str, Any]]:
+        """List runtime move changes without a factual hidden follow-up answer."""
+        return self.request("describe_monster_transient_events")
+
+    def describe_monster_immediate_rule(
+        self, state_handle: str, *, event_index: int, selections: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Evaluate one certified registered-immediate trigger in a hypothetical world."""
+        return self.request("describe_monster_immediate_rule", {
+            "state_handle": state_handle, "event_index": event_index,
+            "selections": selections,
+        })
+
+    def describe_monster_roll_rules(
+        self, state_handle: str, *, event_index: int, selections: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Evaluate native FSM rules in an exact pre-roll hypothetical context."""
+        return self.request("describe_monster_roll_rules", {
+            "state_handle": state_handle, "event_index": event_index,
+            "selections": selections,
+        })
+
+    def describe_monster_rng_provenance(self) -> dict[str, Any]:
+        """Audit native RunRng ownership after Search-local dynamic spawns."""
+        return self.request("describe_monster_rng_provenance")
+
+    def reconstruct_monster_moves(
+        self, state_handle: str, *, selections: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Install complete sampled move histories without executing any monster move."""
+        result = self.request("reconstruct_monster_moves", {
+            "state_handle": state_handle, "selections": selections,
+        })
+        # XuShuxi: Reconstructed child starts a fresh local history; parent remains resident.
+        self._history = []
+        self._remember_handle(result["state_handle"])
+        return result
+
+    def resample_draw_order(
+        self,
+        state_handle: str,
+        *,
+        search_entropy: str,
+        known_draw_top: list[dict[str, Any]] | None = None,
+        known_draw_bottom: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Sample resident hidden order under public semantic positional constraints."""
+        result = self.request("resample_draw_order", {
+            "state_handle": state_handle,
+            "search_entropy": search_entropy,
+            "constraints": {
+                "known_draw_top": known_draw_top if known_draw_top is not None else [],
+                "known_draw_bottom": known_draw_bottom if known_draw_bottom is not None else [],
+            },
+        })
+        # XuShuxi: Retain parent histories; the sampled child has an empty local history.
+        self._history = []
+        self._remember_handle(result["state_handle"])
+        return result
+
+    def export_combat_root(self) -> dict[str, Any]:
+        """Export an exact ordinary-combat root, including factual hidden state."""
+        return self.request("export_combat_root")
+
+    def import_combat_root(self, root: dict[str, Any]) -> dict[str, Any]:
+        """Import into this running worker without source action-history replay."""
+        result = self.request("import_combat_root", root)
+        # XuShuxi: Imported handles belong to a new, empty local history.
+        self._handle_histories.clear()
+        self._record_reset("import_combat_root", root, root["base_reset"], result)
+        return result
+
     def export_branch(self) -> dict[str, Any]:
         if self._reset_state is None or self._reset_request is None: raise NativeSimError("not_reset", "Call reset before exporting a branch")
         state = self.observe()

@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Sts2.NativeSim.Protocol;
 
 namespace Sts2.NativeSim.Core;
@@ -24,6 +25,12 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     // be selected.
     private static readonly int BranchCapacity = int.TryParse(System.Environment.GetEnvironmentVariable("STS2_BRANCH_CAPACITY"), out int cap) && cap > 0 ? cap : 8192;
     private readonly Dictionary<string, Branch> _branches = new(StringComparer.Ordinal);
+    private readonly List<(long sequence, uint combatId, CombatSnapshot? snapshot, string? error)> _monsterRollEvents = [];
+    private readonly List<(long sequence, uint combatId, string kind, string? destination, string? explicitFollowUp, ImmediateRuleSnapshot? immediate)> _monsterTransientEvents = [];
+    private long _monsterMoveEventSequence;
+    private bool _suppressMonsterMoveEvents;
+    private ImmediateRuleSnapshot? _immediateRuleQuery;
+    private object? _immediateRuleResult;
     private readonly LinkedList<string> _branchOrder = new();
     private readonly Dictionary<object, string> _cardInstanceIds = new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<uint, object> _combatCreaturesById = new();
@@ -89,7 +96,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         protocol_version = ProtocolConstants.Version, observation_schema_version = ProtocolConstants.ObservationSchemaVersion,
         server = "sts2-native-sim-godot", persistent = true, certifying = false,
         game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-        methods = new[] { "hello", "catalog", "reset", "run_reset", "map_reset", "reward_reset", "item_reward_reset", "custom_reward_reset", "rest_reset", "event_reset", "observe", "run_observe", "map_observe", "reward_observe", "custom_reward_observe", "rest_observe", "event_observe", "legal_actions", "step", "run_step", "map_step", "reward_step", "custom_reward_step", "rest_step", "event_step", "fork", "restore", "diagnostics", "close" },
+        methods = new[] { "hello", "catalog", "reset", "run_reset", "map_reset", "reward_reset", "item_reward_reset", "custom_reward_reset", "rest_reset", "event_reset", "observe", "run_observe", "map_observe", "reward_observe", "custom_reward_observe", "rest_observe", "event_observe", "legal_actions", "step", "run_step", "map_step", "reward_step", "custom_reward_step", "rest_step", "event_step", "fork", "restore", "export_combat_root", "import_combat_root", "resample_draw_order", "fork_future_rng", "describe_monster_move_candidates", "describe_monster_move_rules", "describe_monster_roll_events", "describe_monster_transient_events", "describe_monster_immediate_rule", "describe_monster_roll_rules", "reconstruct_monster_moves", "describe_monster_rng_provenance", "diagnostics", "close" },
         supported_subset = new { characters = "native CharacterModel entries", encounters = "native EncounterModel entries", cards = "base/upgraded cards plus asynchronous native card, bundle, and relic choices", actions = new[] { "play_card", "use_potion", "discard_potion", "end_turn", "choose_cards", "choose_option", "choose_map", "choose_reward", "choose_rest", "choose_event", "open_treasure", "choose_treasure", "buy_shop", "choose_custom_reward", "skip_custom_rewards", "advance_act" }, potions = true, map = "native deterministic routing graph with composed combat, rest, event, treasure, shop, and inter-act transitions", events = "native model initialization, option continuations, nested event-created combats, blocking custom/linked rewards, and the final victory event" }
     };
 
@@ -143,13 +150,17 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                     model_id = Entry(encounter), runtime_type = encounter.GetType().FullName,
                     room_type = ReflectionTools.Get(encounter, "RoomType")?.ToString(),
                     is_weak = ReflectionTools.Get(encounter, "IsWeak"),
+                    is_debug = ReflectionTools.Get(encounter, "IsDebugEncounter"),
+                    possible_monsters = ReflectionTools.Enumerate(ReflectionTools.Get(encounter, "AllPossibleMonsters"))
+                        .Where(monster => monster is not null).Select(monster => Entry(monster!))
+                        .Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray(),
                     act_indices = actsByEncounter.TryGetValue(Entry(encounter), out HashSet<int>? indices) ? indices.Order().ToArray() : []
                 }).ToArray();
         }
         return new
         {
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            cards = Cards(), encounters = Encounters(), relics = Models("AllRelics"),
+            cards = Cards(), encounters = Encounters(), monsters = Models("Monsters"), relics = Models("AllRelics"),
             potions = Models("AllPotions"), characters = Models("AllCharacters"),
             enchantments = Models("DebugEnchantments"), events = Models("AllEvents")
         };
@@ -158,6 +169,9 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     public EnvironmentResult Reset(ResetRequest request)
     {
         ThrowIfPoisoned();
+        _monsterRollEvents.Clear();
+        _monsterTransientEvents.Clear();
+        _monsterMoveEventSequence = 0;
         QuiesceOutstandingTransition();
         _branches.Clear();
         _branchOrder.Clear();
@@ -227,6 +241,9 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
 
     public async Task<EnvironmentResult> StepAsync(string actionId, bool record = true)
     {
+        _monsterRollEvents.Clear();
+        _monsterTransientEvents.Clear();
+        _monsterMoveEventSequence = 0;
         ThrowIfPoisoned();
         Stopwatch timer = Stopwatch.StartNew();
         // Validate legality before assigning _lastActionId so that a rejected
@@ -279,6 +296,788 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         }
     }
 
+    // XuShuxi: Reuse the resident snapshot codec; exact roots include factual hidden state.
+    private static readonly JsonSerializerOptions PortableRootJson = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
+    };
+
+    public PortableCombatRoot ExportCombatRoot()
+    {
+        ThrowIfPoisoned();
+        EnsureReset();
+        CombatSnapshot snapshot = CaptureCombatSnapshot()
+            ?? throw new ProtocolException("unsupported_combat_root", "An ordinary combat without pending native choice is required.");
+        EnvironmentResult current = Capture(null);
+        return new(1, new(_productVersion, _assemblyHash, _pckHash), _reset!,
+            JsonSerializer.SerializeToElement(snapshot, PortableRootJson), current.StateHash);
+    }
+
+    public EnvironmentResult ImportCombatRoot(PortableCombatRoot root)
+    {
+        ThrowIfPoisoned();
+        if (root.SchemaVersion != 1)
+            throw new ProtocolException("unsupported_combat_root_schema", $"Expected schema 1, obtained {root.SchemaVersion}.");
+        if (root.GameBuild is null || root.GameBuild.Version != _productVersion
+            || root.GameBuild.AssemblySha256 != _assemblyHash || root.GameBuild.PckSha256 != _pckHash)
+            throw new ProtocolException("build_mismatch", "Portable roots require the exact game build identity.");
+        if (root.BaseReset is null || string.IsNullOrWhiteSpace(root.ExpectedStateHash))
+            throw new ProtocolException("invalid_combat_root", "A base reset and expected state hash are required.");
+        CombatSnapshot snapshot = root.CombatSnapshot.Deserialize<CombatSnapshot>(PortableRootJson)
+            ?? throw new ProtocolException("invalid_combat_root", "Missing combat snapshot.");
+        foreach (EnemySnapshot enemy in snapshot.Enemies)
+            if (enemy.MonsterRuntimeState is null)
+                throw new ProtocolException("unsupported_combat_root", "Missing exact monster runtime payload.");
+        Stopwatch timer = Stopwatch.StartNew();
+        Reset(root.BaseReset);
+        if (!RestoreCombatSnapshot(snapshot))
+            throw new ProtocolException("combat_root_restore_failed", _lastSnapshotDebug);
+        // The imported mid-combat state owns a fresh local root with no source history.
+        _branches.Clear();
+        _branchOrder.Clear();
+        _history.Clear();
+        _currentBranchHandle = null;
+        _lastActionId = null;
+        EnvironmentResult imported = Capture(null);
+        if (!StringComparer.Ordinal.Equals(imported.StateHash, root.ExpectedStateHash))
+            throw new ProtocolException("combat_root_hash_mismatch", "Imported combat root is not exact.",
+                new { expected_state_hash = root.ExpectedStateHash, actual_state_hash = imported.StateHash });
+        // XuShuxi: Public state_hash does not cover private monster state. Compare its exact owner payload.
+        CombatSnapshot actual = CaptureCombatSnapshot()
+            ?? throw new ProtocolException("unsupported_combat_root", "Imported root is not quiescent.");
+        if (JsonSerializer.Serialize(snapshot.Enemies, PortableRootJson) != JsonSerializer.Serialize(actual.Enemies, PortableRootJson))
+            throw new ProtocolException("combat_root_monster_mismatch", "Imported monster runtime fingerprint differs.");
+        timer.Stop();
+        return imported with { Transition = new { kind = "portable_combat_root_import", replayed_actions = 0, elapsed_ms = timer.Elapsed.TotalMilliseconds } };
+    }
+
+    public EnvironmentResult ResampleDrawOrder(ResampleDrawOrderRequest request)
+    {
+        ThrowIfPoisoned();
+        EnsureReset();
+        if (!_branches.TryGetValue(request.StateHandle, out Branch? parent))
+            throw new ProtocolException("unknown_state_handle", request.StateHandle);
+        CombatSnapshot snapshot = parent.CombatSnapshot
+            ?? throw new ProtocolException("unsupported_draw_order_root", "A resident ordinary-combat snapshot is required.");
+        if (_runMode || _mapMode || _rewardMode || _restMode || _eventMode || _customRewardMode || _pendingChoice is not null)
+            throw new ProtocolException("unsupported_draw_order_root", "Current worker must own an ordinary combat without pending choice.");
+        if (string.IsNullOrEmpty(request.SearchEntropy) || request.Constraints is null
+            || request.Constraints.KnownDrawTop is null || request.Constraints.KnownDrawBottom is null)
+            throw new ProtocolException("invalid_draw_constraints", "Search entropy and both semantic constraint lists are required.");
+        Stopwatch timer = Stopwatch.StartNew();
+        int size = snapshot.DrawPile.Count;
+        var top = request.Constraints.KnownDrawTop;
+        var bottom = request.Constraints.KnownDrawBottom;
+        if (top.Count > size || bottom.Count > size)
+            throw new ProtocolException("unsatisfiable_draw_constraints", "Constraint length exceeds DrawPile size.");
+        SortedDictionary<int, VisibleDrawCardConstraint> claims = new();
+        void Claim(int position, VisibleDrawCardConstraint fact)
+        {
+            if (fact is null || string.IsNullOrWhiteSpace(fact.ModelId) || fact.Upgrades < 0)
+                throw new ProtocolException("invalid_draw_constraints", "Invalid public card facts.");
+            if (claims.TryGetValue(position, out var prior) && prior != fact)
+                throw new ProtocolException("unsatisfiable_draw_constraints", "Overlapping top/bottom claims disagree.");
+            claims[position] = fact;
+        }
+        for (int i = 0; i < top.Count; i++) Claim(i, top[i]);
+        for (int i = 0; i < bottom.Count; i++) Claim(size - bottom.Count + i, bottom[i]);
+
+        // XuShuxi: Equality classes are disjoint. Uniform draws without replacement
+        // for constrained slots, followed by Fisher-Yates, give every legal instance
+        // permutation the same probability. Native IDs never participate in matching.
+        DrawSamplerRandom random = new(request.SearchEntropy);
+        List<CardSnapshot> available = snapshot.DrawPile.OrderBy(card => card.CombatCardId).ToList();
+        CardSnapshot[] ordered = new CardSnapshot[size];
+        foreach ((int position, var fact) in claims)
+        {
+            CardSnapshot[] matches = available.Where(card => card.ModelId == fact.ModelId
+                && card.Upgrades == fact.Upgrades && card.EnergyCost == fact.CurrentCost && card.CostsX == fact.CostsX).ToArray();
+            if (matches.Length == 0)
+                throw new ProtocolException("unsatisfiable_draw_constraints", "Resident DrawPile cannot satisfy the public card multiplicity.");
+            CardSnapshot chosen = matches[random.Next(matches.Length)];
+            ordered[position] = chosen;
+            available.Remove(chosen);
+        }
+        for (int i = available.Count - 1; i > 0; i--)
+        {
+            int j = random.Next(i + 1);
+            (available[i], available[j]) = (available[j], available[i]);
+        }
+        int unresolved = 0;
+        for (int i = 0; i < size; i++) if (!claims.ContainsKey(i)) ordered[i] = available[unresolved++];
+        CombatSnapshot sampled = snapshot with { DrawPile = ordered.ToList() };
+        bool changed = !snapshot.DrawPile.Select(card => card.InstanceId).SequenceEqual(ordered.Select(card => card.InstanceId));
+        QuiesceOutstandingTransition();
+        _reset = parent.Reset;
+        if (!RestoreCombatSnapshot(sampled))
+            throw new ProtocolException("draw_order_restore_failed", _lastSnapshotDebug);
+        CombatSnapshot actual = CaptureCombatSnapshot()
+            ?? throw new ProtocolException("draw_order_restore_failed", "Restored root has no ordinary-combat snapshot.");
+        if (JsonSerializer.Serialize(actual, PortableRootJson) != JsonSerializer.Serialize(sampled, PortableRootJson))
+            throw new ProtocolException("draw_order_snapshot_mismatch", "Native restore changed state beyond the sampled DrawPile order.",
+                new { expected_snapshot = sampled, actual_snapshot = actual });
+        // A sampled root starts an empty local public history, preserving parent handles.
+        _history.Clear();
+        _currentBranchHandle = null;
+        _lastActionId = null;
+        EnvironmentResult result = Capture(null);
+        timer.Stop();
+        return result with { Transition = new { kind = "draw_order_resample", probability_model = "uniform-visible-constraint-v1",
+            replayed_actions = 0, draw_order_changed = changed, elapsed_ms = timer.Elapsed.TotalMilliseconds } };
+    }
+
+    // XuShuxi: Counter-mode SHA256 supplies search-local bits; rejection avoids modulo bias.
+    private sealed class DrawSamplerRandom(string entropy)
+    {
+        private readonly byte[] _key = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("uniform-visible-constraint-v1\0" + entropy));
+        private ulong _counter;
+        public int Next(int bound)
+        {
+            ulong limit = (1UL << 32) - (1UL << 32) % (uint)bound;
+            while (true)
+            {
+                byte[] input = new byte[_key.Length + sizeof(ulong)];
+                _key.CopyTo(input, 0);
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(input.AsSpan(_key.Length), _counter++);
+                uint value = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(SHA256.HashData(input));
+                if (value < limit) return (int)(value % (uint)bound);
+            }
+        }
+    }
+
+    public EnvironmentResult ForkFutureRng(ForkFutureRngRequest request)
+    {
+        ThrowIfPoisoned();
+        EnsureReset();
+        if (!_branches.TryGetValue(request.StateHandle, out Branch? parent))
+            throw new ProtocolException("unknown_state_handle", request.StateHandle);
+        CombatSnapshot snapshot = parent.CombatSnapshot
+            ?? throw new ProtocolException("unsupported_future_rng_root", "A resident ordinary-combat snapshot is required.");
+        if (_runMode || _mapMode || _rewardMode || _restMode || _eventMode || _customRewardMode || _pendingChoice is not null)
+            throw new ProtocolException("unsupported_future_rng_root", "Ordinary combat without pending choice is required.");
+        if (string.IsNullOrEmpty(request.SearchEntropy))
+            throw new ProtocolException("invalid_search_entropy", "Search entropy is required.");
+        Stopwatch timer = Stopwatch.StartNew();
+        string seed = "sts2-search-future-v1:" + Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
+            "independent-native-future-kernel-v1\0run\0" + request.SearchEntropy)));
+        object fresh = ReflectionTools.Create(T("MegaCrit.Sts2.Core.Runs.RunRngSet"), seed);
+        object serial = ReflectionTools.Invoke(fresh, "ToSerializable")!;
+        Dictionary<string, int> counters = new(StringComparer.Ordinal);
+        foreach (object? pair in ReflectionTools.Enumerate(ReflectionTools.Get(serial, "Counters")))
+            if (pair is not null) counters.Add(Convert.ToString(ReflectionTools.Get(pair, "Key"))!, Convert.ToInt32(ReflectionTools.Get(pair, "Value")));
+        counters = counters.OrderBy(pair => pair.Key, StringComparer.Ordinal).ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+        if (counters.Count == 0 || counters.Values.Any(counter => counter != 0))
+            throw new ProtocolException("unsupported_future_rng_kernel", "Fresh native streams must start at zero.");
+        // XuShuxi: Native combat/model identity separates private streams, never factual RNG state.
+        List<EnemySnapshot> enemies = snapshot.Enemies.Select(enemy =>
+        {
+            string domain = "independent-native-future-kernel-v1\0monster\0" + JsonSerializer.Serialize(new
+                { search_entropy = request.SearchEntropy, combat_id = enemy.CombatId, model_id = enemy.ModelId });
+            uint privateSeed = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(domain)));
+            return enemy with { MonsterRngSeed = privateSeed, MonsterRngCounter = 0 };
+        }).ToList();
+        CombatSnapshot child = snapshot with { RunRngStringSeed = seed, RngCounters = counters, Enemies = enemies };
+        QuiesceOutstandingTransition();
+        _reset = parent.Reset;
+        if (!RestoreCombatSnapshot(child)) throw new ProtocolException("future_rng_restore_failed", _lastSnapshotDebug);
+        CombatSnapshot actual = CaptureCombatSnapshot()
+            ?? throw new ProtocolException("future_rng_restore_failed", "Restored root has no combat snapshot.");
+        if (JsonSerializer.Serialize(actual, PortableRootJson) != JsonSerializer.Serialize(child, PortableRootJson))
+            throw new ProtocolException("future_rng_snapshot_mismatch", "Native restore did not preserve the requested materialized root.",
+                new { expected_snapshot = child, actual_snapshot = actual });
+        _history.Clear();
+        _currentBranchHandle = null;
+        _lastActionId = null;
+        EnvironmentResult result = Capture(null);
+        timer.Stop();
+        return result with { Transition = new { kind = "future_rng_fork", probability_model = "independent-native-future-kernel-v1",
+            replayed_actions = 0, run_rng_replaced = true, monster_run_rng_rebound_count = enemies.Count,
+            monster_private_rng_rekeyed_count = enemies.Count, elapsed_ms = timer.Elapsed.TotalMilliseconds } };
+    }
+
+    // XuShuxi: Enumerate player-facing projections for candidate native moves only.
+    // The factual NextMove and StateLog are deliberately absent from this response.
+    public object DescribeMonsterMoveCandidates()
+    {
+        ThrowIfPoisoned();
+        EnsureReset();
+        if (CaptureCombatSnapshot() is null)
+            throw new ProtocolException("unsupported_monster_move_root", "An ordinary combat snapshot is required.");
+        return ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Enemies"))
+            .Where(creature => creature is not null)
+            .Select(creature =>
+            {
+                object owner = creature!;
+                object monster = ReflectionTools.Get(owner, "Monster")
+                    ?? throw new ProtocolException("unsupported_monster_move_root", "Enemy has no monster model.");
+                object machine = ReflectionTools.Get(monster, "MoveStateMachine")
+                    ?? throw new ProtocolException("unsupported_monster_move_root", "Enemy has no move state machine.");
+                object states = ReflectionTools.Get(machine, "States")!;
+                object[] candidates = ReflectionTools.Enumerate(states)
+                    .Where(pair => pair is not null)
+                    .Select(pair => ReflectionTools.Get(pair!, "Value")!)
+                    .Where(state => Convert.ToBoolean(ReflectionTools.Get(state, "IsMove")))
+                    .OrderBy(state => Convert.ToString(ReflectionTools.Get(state, "Id")), StringComparer.Ordinal)
+                    .Select(state => (object)new
+                    {
+                        move_id = ReflectionTools.Get(state, "Id"),
+                        intents = ReflectionTools.Enumerate(ReflectionTools.Get(state, "Intents"))
+                            .Where(intent => intent is not null).Select(intent => Intent(intent!, owner)).ToArray()
+                    }).ToArray();
+                return (object)new
+                {
+                    combat_id = ReflectionTools.Get(owner, "CombatId"),
+                    model_id = Entry(monster),
+                    candidates
+                };
+            }).ToArray();
+    }
+
+    // XuShuxi: Read the shipped FSM graph. Conditional and random lambdas are
+    // evaluated only after all factual move identities have been replaced by a
+    // complete caller-supplied hypothetical world, then restored in finally.
+    public object DescribeMonsterMoveRules(DescribeMonsterMoveRulesRequest request)
+    {
+        ThrowIfPoisoned();
+        EnsureReset();
+        if (!_branches.TryGetValue(request.StateHandle, out Branch? branch) || branch.CombatSnapshot is null)
+            throw new ProtocolException("unsupported_monster_move_root", "A resident ordinary-combat root is required.");
+        CombatSnapshot before = CaptureCombatSnapshot()
+            ?? throw new ProtocolException("unsupported_monster_move_root", "An ordinary combat snapshot is required.");
+        string sourceJson = JsonSerializer.Serialize(branch.CombatSnapshot, PortableRootJson);
+        if (JsonSerializer.Serialize(before, PortableRootJson) != sourceJson)
+            throw new ProtocolException("monster_move_query_wrong_root", "The requested root is not current.");
+        bool evaluate = request.Selections.Count != 0;
+        if (evaluate && (request.Selections.Count != before.Enemies.Count
+            || request.Selections.Select(item => item.CombatId).Distinct().Count() != before.Enemies.Count))
+            throw new ProtocolException("invalid_monster_move_selection", "Every enemy requires one hypothetical selection.");
+        Dictionary<uint, MonsterMoveSelection> choices = request.Selections.ToDictionary(item => item.CombatId);
+        List<(object monster, object machine, object current, bool first, object? next,
+            IList log, object[] oldLog, List<(object move, bool performed)> performed)> saved = [];
+        bool oldSuppression = _suppressMonsterMoveEvents;
+        _suppressMonsterMoveEvents = true;
+        try
+        {
+            foreach (EnemySnapshot enemy in before.Enemies)
+            {
+                object creature = ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Enemies"))
+                    .Where(item => item is not null && Convert.ToUInt32(ReflectionTools.Get(item!, "CombatId")) == enemy.CombatId)
+                    .SingleOrDefault() ?? throw new ProtocolException("unsupported_monster_move_root", "Enemy binding was lost.");
+                object monster = ReflectionTools.Get(creature, "Monster")!;
+                object machine = ReflectionTools.Get(monster, "MoveStateMachine")!;
+                IList log = (IList)ReflectionTools.Get(machine, "StateLog")!;
+                object states = ReflectionTools.Get(machine, "States")!;
+                List<(object move, bool performed)> performed = ReflectionTools.Enumerate(states)
+                    .Where(pair => pair is not null)
+                    .Select(pair => ReflectionTools.Get(pair!, "Value")!)
+                    .Where(state => Convert.ToBoolean(ReflectionTools.Get(state, "IsMove")))
+                    .Select(state => (state, Convert.ToBoolean(ReflectionTools.Get(state, "_performedAtLeastOnce"))))
+                    .ToList();
+                saved.Add((monster, machine, ReflectionTools.Get(machine, "_currentState")!,
+                    Convert.ToBoolean(ReflectionTools.Get(machine, "_performedFirstMove")),
+                    ReflectionTools.Get(monster, "NextMove"), log,
+                    ReflectionTools.Enumerate(log).Where(item => item is not null).Select(item => item!).ToArray(), performed));
+                if (!evaluate) continue;
+                MonsterMoveSelection choice = choices[enemy.CombatId];
+                Dictionary<string, object> graph = ReflectionTools.Enumerate(states)
+                    .Where(pair => pair is not null)
+                    .ToDictionary(pair => Convert.ToString(ReflectionTools.Get(pair!, "Key"))!,
+                        pair => ReflectionTools.Get(pair!, "Value")!, StringComparer.Ordinal);
+                object? current = graph.GetValueOrDefault(choice.NextMoveId);
+                TransientMoveSnapshot? transient = enemy.TransientMove;
+                string? followUp = choice.TransientFollowUpStateId;
+                bool certifiedTransient = transient is not null
+                    && choice.NextMoveId == transient.MoveId
+                    && followUp is not null && graph.ContainsKey(followUp);
+                if (certifiedTransient)
+                    current = BuildTransientMove(creature, monster, transient! with { FollowUpStateId = followUp! });
+                if (choice.StateLog is null || choice.StateLog.Count == 0 || current is null
+                    || !Convert.ToBoolean(ReflectionTools.Get(current, "IsMove"))
+                    || choice.StateLog.Count(id => id == "STUNNED") != enemy.StateLog.Count(id => id == "STUNNED")
+                    || !choice.StateLog.All(id => id == "STUNNED"
+                        || graph.TryGetValue(id, out object? state)
+                        && Convert.ToBoolean(ReflectionTools.Get(state, "ShouldAppearInLogs"))))
+                    throw new ProtocolException("invalid_monster_move_selection", "Hypothetical FSM move or transient is not certified.");
+                ReflectionTools.Set(machine, "_currentState", current);
+                ReflectionTools.Set(machine, "_performedFirstMove", choice.PerformedFirstMove);
+                ReflectionTools.Set(monster, "NextMove", current);
+                log.Clear();
+                foreach (string id in choice.StateLog)
+                    log.Add(id == "STUNNED" ? choice.NextMoveId == "STUNNED"
+                        ? current : BuildHistoricalStun(creature, monster) : graph[id]);
+                foreach ((object move, _) in performed) ReflectionTools.Set(move, "_performedAtLeastOnce", false);
+            }
+            if (_immediateRuleQuery is { } immediate)
+            {
+                object creature = ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Enemies"))
+                    .Where(item => item is not null && Convert.ToUInt32(ReflectionTools.Get(item!, "CombatId")) == immediate.CombatId)
+                    .SingleOrDefault() ?? throw new ProtocolException("unsupported_monster_immediate_query", "Immediate-rule monster is absent.");
+                object monster = ReflectionTools.Get(creature, "Monster")!;
+                object machine = ReflectionTools.Get(monster, "MoveStateMachine")!;
+                Dictionary<string, object> graph = ReflectionTools.Enumerate(ReflectionTools.Get(machine, "States"))
+                    .Where(pair => pair is not null)
+                    .ToDictionary(pair => Convert.ToString(ReflectionTools.Get(pair!, "Key"))!,
+                        pair => ReflectionTools.Get(pair!, "Value")!, StringComparer.Ordinal);
+                if (!graph.TryGetValue(immediate.DestinationMoveId, out object? destination))
+                    throw new ProtocolException("unsupported_monster_immediate_query", "Immediate destination is absent from the registered FSM.");
+                bool triggered;
+                if (immediate.TriggerMoveId is null) triggered = true;
+                else if (!graph.TryGetValue(immediate.TriggerMoveId, out object? trigger))
+                    throw new ProtocolException("unsupported_monster_immediate_query", "Immediate trigger state is absent from the registered FSM.");
+                else triggered = ReferenceEquals(ReflectionTools.Get(monster, "NextMove"), trigger);
+                _immediateRuleResult = new
+                {
+                    combat_id = immediate.CombatId,
+                    triggered,
+                    destination_move_id = immediate.DestinationMoveId,
+                    must_perform_once = Convert.ToBoolean(ReflectionTools.Get(destination, "MustPerformOnceBeforeTransitioning")),
+                    source_method = immediate.SourceMethod
+                };
+            }
+            return before.Enemies.Select(enemy =>
+            {
+                object creature = ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Enemies"))
+                    .Where(item => item is not null && Convert.ToUInt32(ReflectionTools.Get(item!, "CombatId")) == enemy.CombatId)
+                    .Single()!;
+                object monster = ReflectionTools.Get(creature, "Monster")!;
+                object machine = ReflectionTools.Get(monster, "MoveStateMachine")!;
+                object states = ReflectionTools.Get(machine, "States")!;
+                object[] graph = ReflectionTools.Enumerate(states)
+                    .Where(pair => pair is not null).Select(pair => ReflectionTools.Get(pair!, "Value")!)
+                    .OrderBy(state => Convert.ToString(ReflectionTools.Get(state, "Id")), StringComparer.Ordinal)
+                    .Select(state =>
+                    {
+                        string kind = state.GetType().Name;
+                        string id = Convert.ToString(ReflectionTools.Get(state, "Id"))!;
+                        if (kind == "MoveState")
+                            return (object)new
+                            {
+                                state_id = id, kind, move_id = id,
+                                intents = ReflectionTools.Enumerate(ReflectionTools.Get(state, "Intents"))
+                                    .Where(intent => intent is not null).Select(intent => Intent(intent!, creature)).ToArray(),
+                                follow_up_state_id = ReflectionTools.Get(ReflectionTools.Get(state, "FollowUpState")!, "Id")
+                                    ?? ReflectionTools.Get(state, "FollowUpStateId"),
+                                must_perform_once = ReflectionTools.Get(state, "MustPerformOnceBeforeTransitioning"),
+                                branches = Array.Empty<object>()
+                            };
+                        if (kind == "RandomBranchState")
+                            return (object)new
+                            {
+                                state_id = id, kind, move_id = (object?)null, intents = Array.Empty<object>(),
+                                follow_up_state_id = (object?)null, must_perform_once = (object?)null,
+                                branches = ReflectionTools.Enumerate(ReflectionTools.Get(state, "States"))
+                                    .Where(weight => weight is not null).Select(weight => (object)new
+                                    {
+                                        destination = ReflectionTools.Get(weight!, "stateId"),
+                                        repeat_type = ReflectionTools.Get(weight!, "repeatType")?.ToString(),
+                                        max_repeats = ReflectionTools.Get(weight!, "maxTimes"),
+                                        cooldown = ReflectionTools.Get(weight!, "cooldown"),
+                                        raw_weight = evaluate ? ReflectionTools.Invoke(weight!, "GetWeight") : null,
+                                        effective_weight = evaluate ? ReflectionTools.InvokeStatic(state.GetType(), "GetStateWeight", weight, creature) : null,
+                                        condition = (object?)null
+                                    }).ToArray()
+                            };
+                        if (kind == "ConditionalBranchState")
+                            return (object)new
+                            {
+                                state_id = id, kind, move_id = (object?)null, intents = Array.Empty<object>(),
+                                follow_up_state_id = (object?)null, must_perform_once = (object?)null,
+                                branches = ReflectionTools.Enumerate(ReflectionTools.Get(state, "States"))
+                                    .Where(item => item is not null).Select(item => (object)new
+                                    {
+                                        destination = ReflectionTools.Get(item!, "id"),
+                                        repeat_type = (object?)null, max_repeats = (object?)null,
+                                        cooldown = (object?)null, raw_weight = (object?)null,
+                                        effective_weight = (object?)null,
+                                        condition = evaluate ? ReflectionTools.Invoke(item!, "Evaluate") : null
+                                    }).ToArray()
+                            };
+                        throw new ProtocolException("unsupported_monster_fsm_state", kind);
+                    }).ToArray();
+                if (evaluate && enemy.TransientMove is { } descriptor
+                    && choices[enemy.CombatId].NextMoveId == descriptor.MoveId)
+                {
+                    object transient = ReflectionTools.Get(monster, "NextMove")!;
+                    graph = [.. graph, new
+                    {
+                        state_id = descriptor.MoveId, kind = "MoveState", move_id = descriptor.MoveId,
+                        intents = ReflectionTools.Enumerate(ReflectionTools.Get(transient, "Intents"))
+                            .Where(intent => intent is not null).Select(intent => Intent(intent!, creature)).ToArray(),
+                        follow_up_state_id = ReflectionTools.Get(transient, "FollowUpStateId"),
+                        must_perform_once = ReflectionTools.Get(transient, "MustPerformOnceBeforeTransitioning"),
+                        branches = Array.Empty<object>()
+                    }];
+                }
+                return (object)new
+                {
+                    combat_id = enemy.CombatId, model_id = enemy.ModelId, states = graph,
+                    certified_initial_move_id = StaticInitialMoveProof.FixedMoveId(monster, machine)
+                };
+            }).ToArray();
+        }
+        finally
+        {
+            foreach (var old in saved)
+            {
+                ReflectionTools.Set(old.machine, "_currentState", old.current);
+                ReflectionTools.Set(old.machine, "_performedFirstMove", old.first);
+                ReflectionTools.Set(old.monster, "NextMove", old.next);
+                old.log.Clear();
+                foreach (object state in old.oldLog) old.log.Add(state);
+                foreach ((object move, bool performed) in old.performed)
+                    ReflectionTools.Set(move, "_performedAtLeastOnce", performed);
+            }
+            _suppressMonsterMoveEvents = oldSuppression;
+            CombatSnapshot after = CaptureCombatSnapshot()
+                ?? throw new ProtocolException("monster_move_query_mutated_root", "The query lost its combat snapshot.");
+            if (JsonSerializer.Serialize(after, PortableRootJson) != sourceJson)
+                throw new ProtocolException("monster_move_query_mutated_root", "The query changed its resident root.");
+        }
+    }
+
+    // XuShuxi: Harmony records the exact public/game context immediately
+    // before each shipped-game RollMove. The event listing exposes no move ID.
+    private static void CaptureMonsterRollContext(object __instance)
+    {
+        PersistentNativeCombatEnvironment? environment = _activeEnvironment;
+        if (environment is null) return;
+        uint combatId = 0;
+        try
+        {
+            object creature = ReflectionTools.Get(__instance, "Creature")!;
+            combatId = Convert.ToUInt32(ReflectionTools.Get(creature, "CombatId"));
+            environment._monsterRollEvents.Add((++environment._monsterMoveEventSequence,
+                combatId, environment.CaptureCombatSnapshot(), null));
+        }
+        catch (Exception error)
+        {
+            environment._monsterRollEvents.Add((++environment._monsterMoveEventSequence,
+                combatId, null, ReflectionTools.Unwrap(error).Message));
+        }
+    }
+
+    // XuShuxi: Record the supplied rule argument only after the game actually
+    // installs a new transient. Null retains each hypothetical history's own
+    // last move; the factual StateLog.Last is never exposed.
+    private static void CaptureStunBefore(object __instance, string? nextMoveId, ref object __state)
+    {
+        object? monster = ReflectionTools.Get(__instance, "Monster");
+        __state = (monster is null ? new object() : ReflectionTools.Get(monster, "NextMove")!, nextMoveId);
+    }
+
+    private static void CaptureStunAfter(object __instance, object __state)
+    {
+        PersistentNativeCombatEnvironment? environment = _activeEnvironment;
+        object? monster = ReflectionTools.Get(__instance, "Monster");
+        if (environment is null || monster is null) return;
+        object next = ReflectionTools.Get(monster, "NextMove")!;
+        (object before, string? supplied) = ((object, string?))__state;
+        if (ReferenceEquals(next, before)) return;
+        if (!StringComparer.Ordinal.Equals(Convert.ToString(ReflectionTools.Get(next, "Id")), "STUNNED"))
+            throw new ProtocolException("unsupported_transient_move", "Stun installed an unexpected move.");
+        environment._monsterTransientEvents.Add((++environment._monsterMoveEventSequence,
+            Convert.ToUInt32(ReflectionTools.Get(__instance, "CombatId")), "Stun", "STUNNED",
+            string.IsNullOrEmpty(supplied) ? null : supplied, null));
+    }
+
+    // XuShuxi: Hidden-sensitive registered overrides are observed at the exact
+    // NextMove predicate read. This records that the public event reached the
+    // shipped trigger point without exporting the factual predicate result.
+    private static void CaptureImmediateTriggerProbe(object __instance)
+    {
+        PersistentNativeCombatEnvironment? environment = _activeEnvironment;
+        if (environment is null || environment._suppressMonsterMoveEvents) return;
+        ImmediateRuleSnapshot? rule = ImmediateMoveRuleProof.FromStack(__instance, null);
+        if (rule is null)
+        {
+            if (ImmediateMoveRuleProof.StackCallerContainsImmediate(__instance))
+            {
+                object creature = ReflectionTools.Get(__instance, "Creature")!;
+                environment._monsterTransientEvents.Add((++environment._monsterMoveEventSequence,
+                    Convert.ToUInt32(ReflectionTools.Get(creature, "CombatId")),
+                    "UnsupportedImmediate", null, null, null));
+            }
+            return;
+        }
+        if (rule.TriggerMoveId is null) return;
+        if (environment._monsterTransientEvents.Any(entry => entry.kind == "RegisteredImmediate"
+            && entry.combatId == rule.CombatId && entry.immediate?.SourceMethod == rule.SourceMethod)) return;
+        environment._monsterTransientEvents.Add((++environment._monsterMoveEventSequence,
+            rule.CombatId, "RegisteredImmediate", null, null, rule));
+    }
+
+    private static void CaptureImmediateAfter(object __instance, object state)
+    {
+        PersistentNativeCombatEnvironment? environment = _activeEnvironment;
+        if (environment is null || environment._suppressMonsterMoveEvents) return;
+        object machine = ReflectionTools.Get(__instance, "MoveStateMachine")!;
+        object creature = ReflectionTools.Get(__instance, "Creature")!;
+        bool registered = ReflectionTools.Enumerate(ReflectionTools.Get(machine, "States")).Any(pair => pair is not null
+            && ReferenceEquals(ReflectionTools.Get(pair!, "Value"), state));
+        if (registered)
+        {
+            ImmediateRuleSnapshot? rule = ImmediateMoveRuleProof.FromStack(__instance, state);
+            if (rule is null)
+            {
+                environment._monsterTransientEvents.Add((++environment._monsterMoveEventSequence,
+                    Convert.ToUInt32(ReflectionTools.Get(creature, "CombatId")),
+                    "UnsupportedImmediate", null, null, null));
+                return;
+            }
+            if (rule.TriggerMoveId is not null) return;
+            environment._monsterTransientEvents.Add((++environment._monsterMoveEventSequence,
+                rule.CombatId, "RegisteredImmediate", null, null, rule));
+            return;
+        }
+        string id = Convert.ToString(ReflectionTools.Get(state, "Id"))!;
+        if (id == "STUNNED") return;
+        TransientMoveSnapshot transient = environment.CaptureTransientMove(creature, __instance, machine, state)
+            ?? throw new ProtocolException("unsupported_transient_move", id);
+        string? explicitFollowUp = environment.CertifyTransientExplicitFollowUp(
+            creature, machine, transient);
+        environment._monsterTransientEvents.Add((++environment._monsterMoveEventSequence,
+            Convert.ToUInt32(ReflectionTools.Get(creature, "CombatId")), "RuntimeTransient", id,
+            explicitFollowUp, null));
+    }
+
+    public object DescribeMonsterRollEvents()
+    {
+        ThrowIfPoisoned();
+        return _monsterRollEvents.Select((entry, index) => new
+        {
+            event_index = index, sequence = entry.sequence, combat_id = entry.combatId,
+            available = entry.snapshot is not null,
+            enemy_ids = entry.snapshot?.Enemies.Select(enemy => enemy.CombatId).ToArray(),
+            queryable = entry.snapshot?.Enemies.All(enemy => enemy.NextMoveId is not null) ?? false,
+            error = entry.error
+        }).ToArray();
+    }
+
+    public object DescribeMonsterTransientEvents()
+    {
+        ThrowIfPoisoned();
+        return _monsterTransientEvents.Select((entry, index) => new
+        {
+            event_index = index, sequence = entry.sequence, combat_id = entry.combatId, kind = entry.kind,
+            move_id = entry.kind == "RuntimeTransient" ? entry.destination : null,
+            explicit_follow_up_state_id = entry.explicitFollowUp,
+            source_method = entry.immediate?.SourceMethod
+        }).ToArray();
+    }
+
+    public object DescribeMonsterImmediateRule(DescribeMonsterImmediateRuleRequest request)
+    {
+        ThrowIfPoisoned();
+        if (request.EventIndex < 0 || request.EventIndex >= _monsterTransientEvents.Count)
+            throw new ProtocolException("unsupported_monster_immediate_query", "The immediate event is unavailable.");
+        var entry = _monsterTransientEvents[request.EventIndex];
+        if (entry.kind != "RegisteredImmediate" || entry.immediate is not ImmediateRuleSnapshot rule)
+            throw new ProtocolException("unsupported_monster_immediate_query", "The event is not a certified registered immediate.");
+        if (_immediateRuleQuery is not null)
+            throw new ProtocolException("unsupported_monster_immediate_query", "Nested immediate queries are not supported.");
+        _immediateRuleQuery = rule;
+        _immediateRuleResult = null;
+        try
+        {
+            _ = DescribeMonsterMoveRules(new DescribeMonsterMoveRulesRequest(request.StateHandle, request.Selections));
+            return _immediateRuleResult
+                ?? throw new ProtocolException("unsupported_monster_immediate_query", "The native trigger was not evaluated.");
+        }
+        finally
+        {
+            _immediateRuleQuery = null;
+            _immediateRuleResult = null;
+        }
+    }
+
+    public object DescribeMonsterRollRules(DescribeMonsterRollRulesRequest request)
+    {
+        ThrowIfPoisoned();
+        if (!_branches.TryGetValue(request.StateHandle, out Branch? parent) || parent.CombatSnapshot is null)
+            throw new ProtocolException("unsupported_monster_roll_query", "A resident ordinary-combat decision root is required.");
+        if (request.EventIndex < 0 || request.EventIndex >= _monsterRollEvents.Count
+            || _monsterRollEvents[request.EventIndex].snapshot is not CombatSnapshot rollSnapshot)
+            throw new ProtocolException("unsupported_monster_roll_query", "The exact pre-roll context was not captured.");
+        CombatSnapshot current = CaptureCombatSnapshot()
+            ?? throw new ProtocolException("unsupported_monster_roll_query", "Current combat snapshot is unavailable.");
+        Dictionary<(uint combatId, string moveId), bool> performedBefore = CaptureMovePerformedFlags();
+        string expectedJson = JsonSerializer.Serialize(current, PortableRootJson);
+        if (expectedJson != JsonSerializer.Serialize(parent.CombatSnapshot, PortableRootJson))
+            throw new ProtocolException("monster_roll_query_wrong_root", "Requested decision root is not current.");
+        string temporaryHandle = "roll-query-" + Guid.NewGuid().ToString("N");
+        string? previousHandle = _currentBranchHandle;
+        try
+        {
+            if (!RestoreCombatSnapshot(rollSnapshot))
+                throw new ProtocolException("unsupported_monster_roll_query", _lastSnapshotDebug);
+            _branches[temporaryHandle] = parent with { CombatSnapshot = rollSnapshot };
+            return DescribeMonsterMoveRules(new DescribeMonsterMoveRulesRequest(
+                temporaryHandle, request.Selections));
+        }
+        finally
+        {
+            _branches.Remove(temporaryHandle);
+            if (!RestoreCombatSnapshot(current))
+                throw new ProtocolException("monster_roll_query_restore_failed", _lastSnapshotDebug);
+            RestoreMovePerformedFlags(performedBefore);
+            _currentBranchHandle = previousHandle;
+            CombatSnapshot restored = CaptureCombatSnapshot()
+                ?? throw new ProtocolException("monster_roll_query_restore_failed", "Current snapshot disappeared.");
+            if (JsonSerializer.Serialize(restored, PortableRootJson) != expectedJson)
+                throw new ProtocolException("monster_roll_query_restore_failed", "Query changed the current decision root.");
+            if (!CaptureMovePerformedFlags().OrderBy(entry => entry.Key).SequenceEqual(
+                    performedBefore.OrderBy(entry => entry.Key)))
+                throw new ProtocolException("monster_roll_query_restore_failed", "MoveState performed guards changed.");
+        }
+    }
+
+    private Dictionary<(uint combatId, string moveId), bool> CaptureMovePerformedFlags()
+    {
+        Dictionary<(uint, string), bool> result = [];
+        foreach (object? creature in ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Enemies")))
+        {
+            if (creature is null) continue;
+            uint combatId = Convert.ToUInt32(ReflectionTools.Get(creature, "CombatId"));
+            object machine = ReflectionTools.Get(ReflectionTools.Get(creature, "Monster")!, "MoveStateMachine")!;
+            foreach (object? pair in ReflectionTools.Enumerate(ReflectionTools.Get(machine, "States")))
+            {
+                if (pair is null) continue;
+                object state = ReflectionTools.Get(pair, "Value")!;
+                if (!Convert.ToBoolean(ReflectionTools.Get(state, "IsMove"))) continue;
+                string moveId = Convert.ToString(ReflectionTools.Get(state, "Id"))!;
+                result[(combatId, moveId)] = Convert.ToBoolean(ReflectionTools.Get(state, "_performedAtLeastOnce"));
+            }
+        }
+        return result;
+    }
+
+    private void RestoreMovePerformedFlags(Dictionary<(uint combatId, string moveId), bool> flags)
+    {
+        foreach (object? creature in ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Enemies")))
+        {
+            if (creature is null) continue;
+            uint combatId = Convert.ToUInt32(ReflectionTools.Get(creature, "CombatId"));
+            object machine = ReflectionTools.Get(ReflectionTools.Get(creature, "Monster")!, "MoveStateMachine")!;
+            foreach (object? pair in ReflectionTools.Enumerate(ReflectionTools.Get(machine, "States")))
+            {
+                if (pair is null) continue;
+                object state = ReflectionTools.Get(pair, "Value")!;
+                if (!Convert.ToBoolean(ReflectionTools.Get(state, "IsMove"))) continue;
+                string moveId = Convert.ToString(ReflectionTools.Get(state, "Id"))!;
+                if (!flags.TryGetValue((combatId, moveId), out bool performed))
+                    throw new ProtocolException("monster_roll_query_restore_failed", "A MoveState guard is missing.");
+                ReflectionTools.Set(state, "_performedAtLeastOnce", performed);
+            }
+        }
+    }
+
+    // XuShuxi: Search-only acceptance witness for dynamically spawned RNG owners.
+    public object DescribeMonsterRngProvenance()
+    {
+        ThrowIfPoisoned();
+        EnsureReset();
+        if (CaptureCombatSnapshot() is null)
+            throw new ProtocolException("unsupported_monster_rng_provenance", "An ordinary combat snapshot is required.");
+        object runRng = ReflectionTools.Get(_run!, "Rng")!;
+        return new
+        {
+            run_rng_string_seed = ReflectionTools.Get(runRng, "StringSeed"),
+            monsters = ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Enemies"))
+                .Where(creature => creature is not null)
+                .Select(creature =>
+                {
+                    object monster = ReflectionTools.Get(creature!, "Monster")!;
+                    object privateRng = ReflectionTools.Get(monster, "Rng")!;
+                    return (object)new
+                    {
+                        combat_id = ReflectionTools.Get(creature!, "CombatId"),
+                        run_rng_is_current = ReferenceEquals(ReflectionTools.Get(monster, "RunRng"), runRng),
+                        private_rng_seed = ReflectionTools.Get(privateRng, "Seed"),
+                        private_rng_counter = ReflectionTools.Get(privateRng, "Counter")
+                    };
+                }).ToArray()
+        };
+    }
+
+    public EnvironmentResult ReconstructMonsterMoves(ReconstructMonsterMovesRequest request)
+    {
+        ThrowIfPoisoned();
+        EnsureReset();
+        if (!_branches.TryGetValue(request.StateHandle, out Branch? parent) || parent.CombatSnapshot is null)
+            throw new ProtocolException("unsupported_monster_move_root", "A resident ordinary-combat root is required.");
+        CombatSnapshot source = parent.CombatSnapshot;
+        if (request.Selections is null || request.Selections.Count != source.Enemies.Count
+            || request.Selections.Select(item => item.CombatId).Distinct().Count() != source.Enemies.Count)
+            throw new ProtocolException("invalid_monster_move_selection", "Every enemy requires exactly one selection.");
+        Dictionary<uint, MonsterMoveSelection> selections = request.Selections.ToDictionary(item => item.CombatId);
+        List<EnemySnapshot> sampled = [];
+        foreach (EnemySnapshot enemy in source.Enemies)
+        {
+            if (!selections.TryGetValue(enemy.CombatId, out MonsterMoveSelection? choice)
+                || choice.StateLog is null || choice.StateLog.Count == 0)
+                throw new ProtocolException("invalid_monster_move_selection", "Selection requires a nonempty certified move log.");
+            object creature = ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Enemies"))
+                .Where(item => item is not null && Convert.ToUInt32(ReflectionTools.Get(item!, "CombatId")) == enemy.CombatId)
+                .SingleOrDefault() ?? throw new ProtocolException("unsupported_monster_move_root", "Enemy binding was lost.");
+            object machine = ReflectionTools.Get(ReflectionTools.Get(creature, "Monster")!, "MoveStateMachine")!;
+            object states = ReflectionTools.Get(machine, "States")!;
+            Dictionary<string, object> registered = ReflectionTools.Enumerate(states)
+                .Where(pair => pair is not null)
+                .ToDictionary(pair => Convert.ToString(ReflectionTools.Get(pair!, "Key"))!,
+                    pair => ReflectionTools.Get(pair!, "Value")!, StringComparer.Ordinal);
+            object? current = registered.GetValueOrDefault(choice.NextMoveId);
+            TransientMoveSnapshot? transient = enemy.TransientMove;
+            string? followUp = choice.TransientFollowUpStateId;
+            bool certifiedTransient = transient is not null
+                && choice.NextMoveId == transient.MoveId
+                && followUp is not null && registered.ContainsKey(followUp);
+            if (certifiedTransient) current = BuildTransientMove(creature,
+                ReflectionTools.Get(creature, "Monster")!, transient! with
+                { FollowUpStateId = followUp! });
+            if (current is null || !Convert.ToBoolean(ReflectionTools.Get(current, "IsMove"))
+                || choice.StateLog.Count(id => id == "STUNNED") != enemy.StateLog.Count(id => id == "STUNNED")
+                || !choice.StateLog.All(id => id == "STUNNED" || registered.TryGetValue(id, out object? state)
+                    && Convert.ToBoolean(ReflectionTools.Get(state, "ShouldAppearInLogs"))))
+                throw new ProtocolException("invalid_monster_move_selection", "Selection contains an unknown FSM or transient state.");
+            // XuShuxi: The public-history belief validates transition probabilities;
+            // this native boundary validates graph membership before exact restore.
+            sampled.Add(enemy with { CurrentStateId = choice.NextMoveId, StateLog = choice.StateLog.ToList(),
+                NextMoveId = choice.NextMoveId, PerformedFirstMove = choice.PerformedFirstMove,
+                TransientMove = certifiedTransient ? enemy.TransientMove! with
+                    { FollowUpStateId = choice.TransientFollowUpStateId! } : null });
+        }
+        CombatSnapshot child = source with { Enemies = sampled };
+        QuiesceOutstandingTransition();
+        _reset = parent.Reset;
+        if (!RestoreCombatSnapshot(child))
+            throw new ProtocolException("monster_move_restore_failed", _lastSnapshotDebug);
+        foreach (EnemySnapshot enemy in child.Enemies)
+        {
+            object creature = ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Enemies"))
+                .Where(item => item is not null && Convert.ToUInt32(ReflectionTools.Get(item!, "CombatId")) == enemy.CombatId)
+                .Single()!;
+            object machine = ReflectionTools.Get(ReflectionTools.Get(creature, "Monster")!, "MoveStateMachine")!;
+            foreach (object? pair in ReflectionTools.Enumerate(ReflectionTools.Get(machine, "States")))
+            {
+                if (pair is null) continue;
+                object state = ReflectionTools.Get(pair, "Value")!;
+                if (Convert.ToBoolean(ReflectionTools.Get(state, "IsMove")))
+                    ReflectionTools.Set(state, "_performedAtLeastOnce", false);
+            }
+        }
+        // XuShuxi: A newly sampled current move has not been performed; the
+        // internal MoveState guard must agree with its restored machine log.
+        CombatSnapshot actual = CaptureCombatSnapshot()
+            ?? throw new ProtocolException("monster_move_restore_failed", "Restored root has no snapshot.");
+        if (JsonSerializer.Serialize(actual, PortableRootJson) != JsonSerializer.Serialize(child, PortableRootJson))
+            throw new ProtocolException("monster_move_snapshot_mismatch", "Native FSM restore changed the requested root.");
+        _history.Clear();
+        _currentBranchHandle = null;
+        _lastActionId = null;
+        EnvironmentResult result = Capture(null);
+        return result with { Transition = new { kind = "monster_move_reconstruction", replayed_actions = 0 } };
+    }
+
     public string Fork() => GetOrAddCurrentBranch();
     public object Diagnostics() => new { branch_count = _branches.Count, branch_capacity = BranchCapacity, history_length = _history.Count, current_state_hash = _hash, last_snapshot_debug = _lastSnapshotDebug };
 
@@ -287,7 +1086,8 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         ThrowIfPoisoned();
         if (!_branches.TryGetValue(id, out Branch? branch)) throw new ProtocolException("unknown_state_handle", id);
         List<string> branchHistory = ResolveBranchHistory(branch);
-        if (StringComparer.Ordinal.Equals(_hash, branch.ExpectedHash) && _history.SequenceEqual(branchHistory, StringComparer.Ordinal))
+        if (StringComparer.Ordinal.Equals(_hash, branch.ExpectedHash) && _history.SequenceEqual(branchHistory, StringComparer.Ordinal)
+            && (branch.CombatSnapshot is null || MonsterFingerprintMatches(branch.CombatSnapshot)))
         {
             _currentBranchHandle = id;
             return Capture(new { kind = "restore", replayed_actions = 0, resident_prefix_hit = true, elapsed_ms = 0.0 });
@@ -303,7 +1103,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 _history.AddRange(branchHistory);
                 _currentBranchHandle = id;
                 EnvironmentResult snapResult = Capture(null);
-                if (StringComparer.Ordinal.Equals(snapResult.StateHash, branch.ExpectedHash))
+                if (StringComparer.Ordinal.Equals(snapResult.StateHash, branch.ExpectedHash) && MonsterFingerprintMatches(branch.CombatSnapshot))
                 {
                     timer.Stop();
                     _lastSnapshotDebug = "snapshot_success";
@@ -336,6 +1136,8 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         foreach (string action in branchHistory) { await StepAsync(action, false); _history.Add(action); }
         _currentBranchHandle = id;
         EnvironmentResult result = Capture(null);
+        if (branch.CombatSnapshot is not null && !MonsterFingerprintMatches(branch.CombatSnapshot))
+            throw new ProtocolException("replay_monster_divergence", "Fallback replay did not restore exact monster state.");
         if (!StringComparer.Ordinal.Equals(result.StateHash, branch.ExpectedHash))
             throw new ProtocolException("replay_divergence", $"Expected {branch.ExpectedHash}, obtained {result.StateHash}.", new { history_length = branchHistory.Count });
         timer.Stop(); return result with { Transition = new { kind = "restore", replayed_actions = branchHistory.Count, elapsed_ms = timer.Elapsed.TotalMilliseconds } };
@@ -784,8 +1586,27 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             if (card is null || !(bool)ReflectionTools.Invoke(card, "CanPlay")!) continue; uint cid = Convert.ToUInt32(ReflectionTools.Invoke(db, "GetCardId", card)); string tt = ReflectionTools.Get(card, "TargetType")!.ToString()!;
             string instanceId = GetCardInstanceId(card); string stableId = Uri.EscapeDataString(instanceId);
-            if (!targeted.Contains(tt)) result.Add(new($"play:{stableId}:none", "play_card", new Dictionary<string, object?> { ["instance_id"] = instanceId, ["card_id"] = cid, ["target_id"] = null }));
-            else foreach (object? target in ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Creatures"))) if (target is not null && (bool)ReflectionTools.Invoke(card, "IsValidTarget", target)!) { uint id = Convert.ToUInt32(ReflectionTools.Get(target, "CombatId")); result.Add(new($"play:{stableId}:target:{id}", "play_card", new Dictionary<string, object?> { ["instance_id"] = instanceId, ["card_id"] = cid, ["target_id"] = id })); }
+            if (!targeted.Contains(tt))
+            {
+                result.Add(new($"play:{stableId}:none", "play_card", new Dictionary<string, object?>
+                {
+                    ["instance_id"] = instanceId, ["card_id"] = cid, ["target_id"] = null,
+                    ["visible_preview"] = CardVisiblePreview(card, null)
+                }));
+            }
+            else
+            {
+                foreach (object? target in ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Creatures")))
+                {
+                    if (target is null || !(bool)ReflectionTools.Invoke(card, "IsValidTarget", target)!) continue;
+                    uint id = Convert.ToUInt32(ReflectionTools.Get(target, "CombatId"));
+                    result.Add(new($"play:{stableId}:target:{id}", "play_card", new Dictionary<string, object?>
+                    {
+                        ["instance_id"] = instanceId, ["card_id"] = cid, ["target_id"] = id,
+                        ["visible_preview"] = CardVisiblePreview(card, target)
+                    }));
+                }
+            }
         }
         IReadOnlyList<object?> potionSlots = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "PotionSlots"));
         for (int slot = 0; slot < potionSlots.Count; slot++)
@@ -805,6 +1626,37 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 result.Add(new($"discard_potion:{slot}", "discard_potion", new Dictionary<string, object?> { ["slot"] = slot, ["model_id"] = potionId }));
         }
         result.Add(new("end_turn", "end_turn", new Dictionary<string, object?>())); return result;
+    }
+
+    private object CardVisiblePreview(object card, object? target)
+    {
+        object dynamicVars = ReflectionTools.Get(card, "DynamicVars")
+            ?? throw new MissingMemberException(card.GetType().FullName, "DynamicVars");
+        object previewMode = Enum.Parse(T("MegaCrit.Sts2.Core.Entities.Cards.CardPreviewMode"), "Normal");
+        object pileType = Enum.Parse(T("MegaCrit.Sts2.Core.Entities.Cards.PileType"), "Hand");
+        ReflectionTools.Invoke(dynamicVars, "ClearPreview");
+        try
+        {
+            ReflectionTools.Invoke(card, "UpdateDynamicVarPreview", previewMode, target, dynamicVars);
+            string description = ReflectionTools.Invoke(card, "GetDescriptionForPile", pileType, target) as string
+                ?? throw new ProtocolException("invalid_state", "Native card preview produced no description.");
+
+            object energyCost = ReflectionTools.Get(card, "EnergyCost")
+                ?? throw new MissingMemberException(card.GetType().FullName, "EnergyCost");
+            bool costsX = Convert.ToBoolean(ReflectionTools.Get(energyCost, "CostsX"));
+            int? xCostSpend = costsX
+                ? Convert.ToInt32(ReflectionTools.Invoke(energyCost, "GetAmountToSpend"))
+                : null;
+            return new JsonObject
+            {
+                ["description"] = description,
+                ["x_cost_spend"] = xCostSpend
+            };
+        }
+        finally
+        {
+            ReflectionTools.Invoke(dynamicVars, "ClearPreview");
+        }
     }
 
     private void InitializeMap()
@@ -1720,7 +2572,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             model_id = ReflectionTools.Get(ReflectionTools.Get(creature, "ModelId")!, "Entry"), side = ReflectionTools.Get(creature, "Side")!.ToString(),
             hp = ReflectionTools.Get(creature, "CurrentHp"), max_hp = ReflectionTools.Get(creature, "MaxHp"), block = ReflectionTools.Get(creature, "Block"), alive = ReflectionTools.Get(creature, "IsAlive"),
-            powers = ReflectionTools.Enumerate(ReflectionTools.Get(creature, "Powers")).Where(power => power is not null).Select(power => new { model_id = Entry(power!), amount = ReflectionTools.Get(power!, "Amount") }).ToArray(),
+            powers = ReflectionTools.Enumerate(ReflectionTools.Get(creature, "Powers")).Where(power => power is not null).Select(power => PowerObservationSnapshot(power!)).ToArray(),
             next_move = move is null ? null : new { id = ReflectionTools.Get(move, "Id"), intents }
         };
     }
@@ -1921,8 +2773,23 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     {
         object? monster = ReflectionTools.Get(c, "Monster"), move = monster is null ? null : ReflectionTools.Get(monster, "NextMove");
         object[] intents = move is null ? [] : ReflectionTools.Enumerate(ReflectionTools.Get(move, "Intents")).Where(x => x is not null).Select(x => Intent(x!, c)).ToArray();
-        return new { combat_id = ReflectionTools.Get(c, "CombatId"), model_id = ReflectionTools.Get(ReflectionTools.Get(c, "ModelId")!, "Entry"), side = ReflectionTools.Get(c, "Side")!.ToString(), hp = ReflectionTools.Get(c, "CurrentHp"), max_hp = ReflectionTools.Get(c, "MaxHp"), block = ReflectionTools.Get(c, "Block"), alive = ReflectionTools.Get(c, "IsAlive"), next_move = move is null ? null : new { id = ReflectionTools.Get(move, "Id"), intents }, powers = ReflectionTools.Enumerate(ReflectionTools.Get(c, "Powers")).Where(x => x is not null).Select(x => new { model_id = Entry(x!), amount = ReflectionTools.Get(x!, "Amount") }).ToArray() };
+        return new { combat_id = ReflectionTools.Get(c, "CombatId"), model_id = ReflectionTools.Get(ReflectionTools.Get(c, "ModelId")!, "Entry"), side = ReflectionTools.Get(c, "Side")!.ToString(), hp = ReflectionTools.Get(c, "CurrentHp"), max_hp = ReflectionTools.Get(c, "MaxHp"), block = ReflectionTools.Get(c, "Block"), alive = ReflectionTools.Get(c, "IsAlive"), next_move = move is null ? null : new { id = ReflectionTools.Get(move, "Id"), intents }, powers = ReflectionTools.Enumerate(ReflectionTools.Get(c, "Powers")).Where(x => x is not null).Select(x => PowerObservationSnapshot(x!)).ToArray() };
     }
+    private object PowerObservationSnapshot(object power)
+    {
+        string stackType = ReflectionTools.Get(power, "StackType")?.ToString()
+            ?? throw new MissingMemberException(power.GetType().FullName, "StackType");
+        return new
+        {
+            model_id = Entry(power),
+            amount = ReflectionTools.Get(power, "Amount"),
+            is_visible = Convert.ToBoolean(ReflectionTools.Get(power, "IsVisible")),
+            display_amount = StringComparer.Ordinal.Equals(stackType, "Counter")
+                ? Convert.ToInt32(ReflectionTools.Get(power, "DisplayAmount"))
+                : (int?)null
+        };
+    }
+
     private object Intent(object i, object owner)
     {
         object? damage = null, repeats = null; if (i.GetType().IsSubclassOf(T("MegaCrit.Sts2.Core.MonsterMoves.Intents.AttackIntent"))) { damage = ReflectionTools.Invoke(i, "GetSingleDamage", ReflectionTools.Get(ReflectionTools.Get(owner, "CombatState")!, "Allies"), owner); repeats = ReflectionTools.Get(i, "Repeats"); }
@@ -2079,6 +2946,15 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         Assembly ha = _context.LoadDependency("0Harmony.dll"); Type ht = ha.GetType("HarmonyLib.Harmony", true)!, hmt = ha.GetType("HarmonyLib.HarmonyMethod", true)!; object harmony = Activator.CreateInstance(ht, "sts2.native-sim.persistent")!; MethodInfo patch = ht.GetMethods().Single(x => x.Name == "Patch" && x.GetParameters().Length == 5);
         void P(MethodInfo m, string n) => patch.Invoke(harmony, [m, Activator.CreateInstance(hmt, typeof(PersistentNativeCombatEnvironment).GetMethod(n, BindingFlags.NonPublic | BindingFlags.Static)!), null, null, null]);
         void Po(MethodInfo m, string n) => patch.Invoke(harmony, [m, null, Activator.CreateInstance(hmt, typeof(PersistentNativeCombatEnvironment).GetMethod(n, BindingFlags.NonPublic | BindingFlags.Static)!), null, null]);
+        P(T("MegaCrit.Sts2.Core.Models.MonsterModel").GetMethod("RollMove", BindingFlags.Public | BindingFlags.Instance)!, nameof(CaptureMonsterRollContext));
+        MethodInfo stun = T("MegaCrit.Sts2.Core.Entities.Creatures.Creature").GetMethod("StunInternal", BindingFlags.Public | BindingFlags.Instance)!;
+        P(stun, nameof(CaptureStunBefore));
+        Po(stun, nameof(CaptureStunAfter));
+        Type monsterModel = T("MegaCrit.Sts2.Core.Models.MonsterModel");
+        MethodInfo nextMoveGetter = monsterModel.GetProperty("NextMove", BindingFlags.Public | BindingFlags.Instance)!.GetMethod!;
+        Po(nextMoveGetter, nameof(CaptureImmediateTriggerProbe));
+        MethodInfo immediate = monsterModel.GetMethod("SetMoveImmediate", BindingFlags.Public | BindingFlags.Instance)!;
+        Po(immediate, nameof(CaptureImmediateAfter));
         P(T("MegaCrit.Sts2.Core.Commands.CreatureCmd").GetMethod("TriggerAnim", BindingFlags.Public | BindingFlags.Static)!, nameof(SkipTask));
         foreach (MethodInfo m in T("MegaCrit.Sts2.Core.Commands.SfxCmd").GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly)) { if (m.ReturnType != typeof(void)) throw new InvalidOperationException($"State-bearing SfxCmd: {m}"); P(m, nameof(SkipVoid)); }
         foreach (MethodInfo m in T("MegaCrit.Sts2.Core.Commands.ThinkCmd").GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly)) P(m, nameof(SkipVoid));
@@ -2637,6 +3513,157 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         return [.. leaf.History];
     }
 
+    private TransientMoveSnapshot? CaptureTransientMove(object creature, object monster, object machine, object move)
+    {
+        object states = ReflectionTools.Get(machine, "States")!;
+        if (ReflectionTools.Enumerate(states).Any(pair => pair is not null &&
+            ReferenceEquals(ReflectionTools.Get(pair!, "Value"), move))) return null;
+        string id = Convert.ToString(ReflectionTools.Get(move, "Id"))!;
+        if (id == "UNSET_MOVE") return null;
+        if (move.GetType() != T("MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState"))
+            throw new ProtocolException("unsupported_transient_move", id);
+        Delegate wrapper = ReflectionTools.Get(move, "_onPerform") as Delegate
+            ?? throw new ProtocolException("unsupported_transient_move", "Runtime MoveState behavior delegate is missing.");
+        Delegate inner = wrapper;
+        bool residentOwner = wrapper.Method.DeclaringType == typeof(PersistentNativeCombatEnvironment)
+            || ReferenceEquals(wrapper.Target, monster)
+            || ReflectionTools.Enumerate(ReflectionTools.Get(creature, "Powers"))
+                .Any(power => ReferenceEquals(power, wrapper.Target));
+        if (!residentOwner && id == "STUNNED")
+            inner = wrapper.Target?.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                .Where(field => field.Name == "stunMove" && typeof(Delegate).IsAssignableFrom(field.FieldType))
+                .Select(field => field.GetValue(wrapper.Target) as Delegate).SingleOrDefault()
+                ?? throw new ProtocolException("unsupported_transient_move", "Stun wrapper does not expose its native behavior.");
+        else if (!residentOwner)
+            throw new ProtocolException("unsupported_transient_move", "Runtime MoveState behavior owner is not directly certifiable.");
+        string owner;
+        int? powerIndex = null;
+        if (inner.Method.DeclaringType == typeof(PersistentNativeCombatEnvironment)
+            || inner.Method.DeclaringType?.FullName?.StartsWith("MegaCrit.Sts2.Core.Commands.CreatureCmd", StringComparison.Ordinal) == true)
+            owner = "NoOp";
+        else if (ReferenceEquals(inner.Target, monster)) owner = "Monster";
+        else
+        {
+            object[] powers = ReflectionTools.Enumerate(ReflectionTools.Get(creature, "Powers"))
+                .Where(power => power is not null).Select(power => power!).ToArray();
+            int index = Array.FindIndex(powers, power => ReferenceEquals(power, inner.Target));
+            if (index < 0) throw new ProtocolException("unsupported_transient_move", "Runtime MoveState behavior owner is not resident.");
+            owner = "Power";
+            powerIndex = index;
+        }
+        string followUp = Convert.ToString(ReflectionTools.Get(move, "FollowUpStateId"))
+            ?? throw new ProtocolException("unsupported_transient_move", "Runtime MoveState has no follow-up state.");
+        string[] intentTypes = ReflectionTools.Enumerate(ReflectionTools.Get(move, "Intents"))
+            .Where(intent => intent is not null)
+            .Select(intent => intent!.GetType().FullName
+                ?? throw new ProtocolException("unsupported_transient_move", "Runtime MoveState intent type is unnamed."))
+            .ToArray();
+        if (intentTypes.Length == 0)
+            throw new ProtocolException("unsupported_transient_move", "Runtime MoveState has no certified intents.");
+        return new(id, followUp,
+            Convert.ToBoolean(ReflectionTools.Get(move, "MustPerformOnceBeforeTransitioning")),
+            Convert.ToBoolean(ReflectionTools.Get(move, "_performedAtLeastOnce")),
+            owner, owner == "NoOp" ? null : inner.Method.Name, powerIndex, intentTypes);
+    }
+
+    private string? CertifyTransientExplicitFollowUp(
+        object creature, object machine, TransientMoveSnapshot descriptor)
+    {
+        if (descriptor.BehaviorOwner == "Power" && descriptor.PowerIndex is int index)
+        {
+            object power = ReflectionTools.Enumerate(ReflectionTools.Get(creature, "Powers"))
+                .Where(item => item is not null).ElementAt(index)!;
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            MemberInfo? member = power.GetType().GetProperty("FollowUpStateId", flags)
+                ?? (MemberInfo?)power.GetType().GetField("FollowUpStateId", flags);
+            object? configured = member switch
+            {
+                PropertyInfo property => property.GetValue(power),
+                FieldInfo field => field.GetValue(power),
+                _ => null
+            };
+            string? configuredId = Convert.ToString(configured);
+            if (!string.IsNullOrEmpty(configuredId))
+            {
+                if (!StringComparer.Ordinal.Equals(configuredId, descriptor.FollowUpStateId))
+                    throw new ProtocolException("unsupported_transient_move", "Power follow-up differs from the runtime MoveState.");
+                return configuredId;
+            }
+        }
+        // XuShuxi: the factual prior is used only as a native certificate that
+        // the shipped fallback was taken. It is never exported to Search.
+        object? last = ReflectionTools.Enumerate(ReflectionTools.Get(machine, "StateLog")).LastOrDefault(item => item is not null);
+        string? prior = last is null ? null : Convert.ToString(ReflectionTools.Get(last, "Id"));
+        if (!StringComparer.Ordinal.Equals(prior, descriptor.FollowUpStateId))
+            throw new ProtocolException("unsupported_transient_move", "Runtime MoveState follow-up source is not certified.");
+        return null;
+    }
+
+    private static Task NoOpTransientMove<T>(IReadOnlyList<T> _) => Task.CompletedTask;
+
+    private object BuildHistoricalStun(object creature, object monster)
+    {
+        object states = ReflectionTools.Get(ReflectionTools.Get(monster, "MoveStateMachine")!, "States")!;
+        string followUp = ReflectionTools.Enumerate(states).Where(pair => pair is not null)
+            .Select(pair => ReflectionTools.Get(pair!, "Value")!)
+            .Where(state => Convert.ToBoolean(ReflectionTools.Get(state, "IsMove")))
+            .Select(state => Convert.ToString(ReflectionTools.Get(state, "Id"))!).First();
+        return BuildTransientMove(creature, monster, new(
+            "STUNNED", followUp, true, false, "NoOp", null, null,
+            ["MegaCrit.Sts2.Core.MonsterMoves.Intents.StunIntent"]));
+    }
+
+    private object BuildTransientMove(object creature, object monster, TransientMoveSnapshot descriptor)
+    {
+        if (!descriptor.MustPerformOnce)
+            throw new ProtocolException("unsupported_transient_move", descriptor.MoveId);
+        object machine = ReflectionTools.Get(monster, "MoveStateMachine")!;
+        object states = ReflectionTools.Get(machine, "States")!;
+        if (!ReflectionTools.Enumerate(states).Any(pair => pair is not null &&
+            StringComparer.Ordinal.Equals(Convert.ToString(ReflectionTools.Get(pair!, "Key")), descriptor.FollowUpStateId)))
+            throw new ProtocolException("unsupported_transient_move", "Runtime MoveState follow-up is absent from the native FSM.");
+        Type creatureType = T("MegaCrit.Sts2.Core.Entities.Creatures.Creature");
+        Type delegateType = typeof(Func<,>).MakeGenericType(
+            typeof(IReadOnlyList<>).MakeGenericType(creatureType), typeof(Task));
+        Delegate behavior;
+        if (descriptor.BehaviorOwner == "NoOp")
+        {
+            MethodInfo method = typeof(PersistentNativeCombatEnvironment)
+                .GetMethod(nameof(NoOpTransientMove), BindingFlags.NonPublic | BindingFlags.Static)!
+                .MakeGenericMethod(creatureType);
+            behavior = Delegate.CreateDelegate(delegateType, method);
+        }
+        else
+        {
+            object owner = descriptor.BehaviorOwner switch
+            {
+                "Monster" => monster,
+                "Power" when descriptor.PowerIndex is int index => ReflectionTools.Enumerate(ReflectionTools.Get(creature, "Powers"))
+                    .Where(power => power is not null).ElementAt(index)!,
+                _ => throw new ProtocolException("unsupported_transient_move", "Unknown runtime MoveState behavior owner.")
+            };
+            MethodInfo method = owner.GetType().GetMethod(descriptor.BehaviorMethod!,
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new ProtocolException("unsupported_transient_move", "Runtime MoveState behavior method is unavailable.");
+            behavior = Delegate.CreateDelegate(delegateType, owner, method);
+        }
+        Type moveType = T("MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState");
+        Type intentBase = T("MegaCrit.Sts2.Core.MonsterMoves.Intents.AbstractIntent");
+        Array intents = Array.CreateInstance(intentBase, descriptor.IntentTypeNames.Length);
+        for (int index = 0; index < descriptor.IntentTypeNames.Length; index++)
+        {
+            Type intentType = T(descriptor.IntentTypeNames[index]);
+            if (!intentBase.IsAssignableFrom(intentType))
+                throw new ProtocolException("unsupported_transient_move", "Runtime MoveState intent type is invalid.");
+            intents.SetValue(ReflectionTools.Create(intentType), index);
+        }
+        object move = ReflectionTools.Create(moveType, descriptor.MoveId, behavior, intents);
+        ReflectionTools.Set(move, "FollowUpStateId", descriptor.FollowUpStateId);
+        ReflectionTools.Set(move, "MustPerformOnceBeforeTransitioning", true);
+        ReflectionTools.Set(move, "_performedAtLeastOnce", descriptor.PerformedAtLeastOnce);
+        return move;
+    }
+
     private CombatSnapshot? CaptureCombatSnapshot()
     {
         if (_runMode || _mapMode || _rewardMode || _restMode || _eventMode || _customRewardMode || _combat is null || _pcs is null || _player is null || _reset is null)
@@ -2644,6 +3671,8 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         if (_pendingChoice is not null)
             return null;
 
+        bool oldSuppression = _suppressMonsterMoveEvents;
+        _suppressMonsterMoveEvents = true;
         try
         {
             object playerCreature = ReflectionTools.Get(_player, "Creature")!;
@@ -2661,6 +3690,11 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
 
             // Run RNG counters
             SortedDictionary<string, int> rngCounters = RunRngCounters();
+
+            // XuShuxi: Native IDs and their allocation continuation are exact combat state.
+            object cardDb = ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.GameActions.Multiplayer.NetCombatCardDb"), "Instance")!;
+            uint nextCardId = ReflectionTools.Get(cardDb, "_nextId") is uint next ? next
+                : throw new ProtocolException("unsupported_card_db", "Expected UInt32 _nextId.");
 
             // Cards in all 5 piles
             List<CardSnapshot> CapturePile(string name)
@@ -2684,9 +3718,11 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                     var savedProps = SavedNativeState(card);
                     list.Add(new CardSnapshot(
                         instanceId,
+                        (uint)ReflectionTools.Invoke(cardDb, "GetCardId", card)!,
                         modelId,
                         upgrades,
                         resolvedCost,
+                        (bool)ReflectionTools.Get(cost, "CostsX")!,
                         baseCost,
                         retain,
                         sly,
@@ -2738,6 +3774,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 int monsterRngCounter = 0;
                 uint monsterRngSeed = 0;
                 string? nextMoveId = null;
+                TransientMoveSnapshot? transientMove = null;
 
                 if (monster is not null)
                 {
@@ -2758,7 +3795,10 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                     }
                     object? nextMove = ReflectionTools.Get(monster, "NextMove");
                     if (nextMove is not null)
+                    {
                         nextMoveId = ReflectionTools.Get(nextMove, "Id")?.ToString();
+                        transientMove = CaptureTransientMove(enemy, monster, machine, nextMove);
+                    }
                 }
 
                 enemies.Add(new EnemySnapshot(
@@ -2774,7 +3814,9 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                     stateLog,
                     monsterRngCounter,
                     monsterRngSeed,
-                    nextMoveId
+                    nextMoveId,
+                    monster is null ? null : CaptureMonsterRuntimeState(monster),
+                    transientMove
                 ));
             }
 
@@ -2830,6 +3872,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 roundNumber,
                 currentSide,
                 nextCreatureId,
+                nextCardId,
                 _dynamicCardOrdinal,
                 new Dictionary<string, int>(rngCounters, StringComparer.Ordinal),
                 CapturePile("Hand"),
@@ -2841,14 +3884,17 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 enemies,
                 relics,
                 potions,
-                orbQueueSnapshot
+                orbQueueSnapshot,
+                (string)ReflectionTools.Get(ReflectionTools.Get(_run!, "Rng")!, "StringSeed")!
             );
         }
+        catch (ProtocolException) { throw; }
         catch (Exception ex)
         {
             _lastSnapshotDebug = $"capture_ex: {ex.Message}";
             return null;
         }
+        finally { _suppressMonsterMoveEvents = oldSuppression; }
     }
 
     private bool RestoreCombatSnapshot(CombatSnapshot snap)
@@ -2857,6 +3903,22 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
 
         try
         {
+            // XuShuxi: Reject ambiguous bindings before mutating any native state.
+            CardSnapshot[] residentCards = snap.Hand.Concat(snap.DrawPile).Concat(snap.DiscardPile)
+                .Concat(snap.ExhaustPile).Concat(snap.PlayPile).ToArray();
+            if (residentCards.Select(c => c.CombatCardId).Distinct().Count() != residentCards.Length
+                || residentCards.Select(c => c.InstanceId).Distinct(StringComparer.Ordinal).Count() != residentCards.Length
+                || residentCards.Any(c => string.IsNullOrWhiteSpace(c.InstanceId) || c.CombatCardId >= snap.NextCardId))
+                throw new ProtocolException("invalid_card_db_snapshot", "Resident bindings must be unique and below saved next-id.");
+            object cardDb = ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.GameActions.Multiplayer.NetCombatCardDb"), "Instance")!;
+            Type cardType = T("MegaCrit.Sts2.Core.Models.CardModel");
+            if (ReflectionTools.Get(cardDb, "_nextId") is not uint
+                || ReflectionTools.Get(cardDb, "_idToCard") is not IDictionary idToCard
+                || idToCard.GetType() != typeof(Dictionary<,>).MakeGenericType(typeof(uint), cardType)
+                || ReflectionTools.Get(cardDb, "_cardToId") is not IDictionary cardToId
+                || cardToId.GetType() != typeof(Dictionary<,>).MakeGenericType(cardType, typeof(uint)))
+                throw new ProtocolException("unsupported_card_db", "Native card identity fields do not match the pinned ABI.");
+
             // 1. Player creature stats
             object playerCreature = ReflectionTools.Get(_player, "Creature")!;
             ReflectionTools.Set(playerCreature, "CurrentHp", snap.PlayerHp);
@@ -2937,18 +3999,17 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             RestorePile("ExhaustPile", snap.ExhaustPile);
             RestorePile("PlayPile", snap.PlayPile);
 
-            // 3b. Rebind NetCombatCardDb to the restored card instances.
-            // After pile reconstruction the singleton may hold stale registrations
-            // (e.g. from dynamically-generated tokens like Slimed that were created
-            // during a previous step but are now reconstructed as new or reused
-            // objects).  Mirroring what Reset() does at construction time keeps
-            // GetCardId() coherent for BuildActionsRaw / PlayAsync.
+            // XuShuxi: Preserve Construct's pile subscriptions, replacing only exact identity state.
+            idToCard.Clear();
+            cardToId.Clear();
+            Dictionary<string, object> restoredCards = _cardInstanceIds.ToDictionary(pair => pair.Value, pair => pair.Key, StringComparer.Ordinal);
+            foreach (CardSnapshot card in residentCards)
             {
-                Type playerType = T("MegaCrit.Sts2.Core.Entities.Players.Player");
-                object cardDb = ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.GameActions.Multiplayer.NetCombatCardDb"), "Instance")!;
-                ReflectionTools.Invoke(cardDb, "ClearCardsForTesting");
-                ReflectionTools.Invoke(cardDb, "StartCombat", List(playerType, [_player]));
+                object restoredCard = restoredCards[card.InstanceId];
+                idToCard.Add(card.CombatCardId, restoredCard);
+                cardToId.Add(restoredCard, card.CombatCardId);
             }
+            ReflectionTools.Set(cardDb, "_nextId", snap.NextCardId);
 
             // 4. Player powers
             RestoreCreaturePowers(playerCreature, snap.PlayerPowers);
@@ -3004,13 +4065,17 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             combatEnemies.Clear();
             foreach (EnemySnapshot es in snap.Enemies)
             {
+                bool created = false;
                 if (!_combatCreaturesById.TryGetValue(es.CombatId, out object? creature))
                 {
                     object monster = Mutable("Monsters", es.ModelId);
+                    ApplyMonsterRuntimeState(monster, es.MonsterRuntimeState);
                     object enemySide = Enum.Parse(T("MegaCrit.Sts2.Core.Combat.CombatSide"), "Enemy", true);
                     creature = ReflectionTools.Invoke(_combat, "CreateCreature", monster, enemySide, es.SlotName)!;
                     ReflectionTools.Set(creature, "CombatId", es.CombatId);
-                    _combatCreaturesById[es.CombatId] = creature;
+                    ReflectionTools.Invoke(_combat, "AddCreature", creature);
+                    ReflectionTools.Invoke(_manager!, "AddCreature", creature);
+                    created = true;
                 }
 
                 ReflectionTools.Set(creature, "CombatState", _combat);
@@ -3022,28 +4087,35 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 object? monsterObj = ReflectionTools.Get(creature, "Monster");
                 if (monsterObj is not null)
                 {
+                    ApplyMonsterRuntimeState(monsterObj, es.MonsterRuntimeState);
                     object machine = ReflectionTools.Get(monsterObj, "MoveStateMachine")!;
                     object states = ReflectionTools.Get(machine, "States")!;
                     object? State(string sid) => ReflectionTools.Enumerate(states)
                         .Where(p => p is not null && StringComparer.Ordinal.Equals(Convert.ToString(ReflectionTools.Get(p!, "Key")), sid))
                         .Select(p => ReflectionTools.Get(p!, "Value")!)
                         .SingleOrDefault();
+                    object? transient = es.TransientMove is null ? null
+                        : BuildTransientMove(creature, monsterObj, es.TransientMove);
+                    object? ResolvedState(string sid) => es.TransientMove is { } descriptor
+                        && sid == descriptor.MoveId ? transient
+                        : sid == "STUNNED" ? BuildHistoricalStun(creature, monsterObj) : State(sid);
 
                     if (es.CurrentStateId is not null)
                     {
-                        object? st = State(es.CurrentStateId);
-                        if (st is not null)
-                            ReflectionTools.Invoke(machine, "ForceCurrentState", st);
+                        object? st = ResolvedState(es.CurrentStateId);
+                        if (st is null) throw new ProtocolException("unsupported_transient_move", es.CurrentStateId);
+                        ReflectionTools.Set(machine, "_currentState", st);
                     }
                     ReflectionTools.Set(machine, "_performedFirstMove", es.PerformedFirstMove);
                     IList stateLog = (IList)ReflectionTools.Get(machine, "StateLog")!;
                     stateLog.Clear();
                     foreach (string sid in es.StateLog)
                     {
-                        object? st = State(sid);
-                        if (st is not null) stateLog.Add(st);
+                        object? st = ResolvedState(sid);
+                        if (st is null) throw new ProtocolException("unsupported_transient_move", sid);
+                        stateLog.Add(st);
                     }
-                    if (es.MonsterRngSeed != 0)
+                    // UInt32 zero is also a valid independent native RNG seed.
                     {
                         object newRng = ReflectionTools.Create(T("MegaCrit.Sts2.Core.Random.Rng"), es.MonsterRngSeed, es.MonsterRngCounter);
                         ReflectionTools.Set(monsterObj, "Rng", newRng);
@@ -3051,16 +4123,58 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                     if (es.NextMoveId is not null)
                     {
                         object? moveState = State(es.NextMoveId);
-                        if (moveState is not null)
+                        if (StringComparer.Ordinal.Equals(es.NextMoveId, "UNSET_MOVE"))
+                        {
+                            // XuShuxi: A just-spawned monster may not have rolled
+                            // its first move at a captured pre-roll boundary.
+                            // Restore the game's own default placeholder without
+                            // running SetMoveImmediate or any intent hooks.
+                            ReflectionTools.Set(monsterObj, "NextMove",
+                                ReflectionTools.Create(T("MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState")));
+                        }
+                        else if (moveState is not null)
                             ReflectionTools.Invoke(monsterObj, "SetMoveImmediate", moveState, true);
+                        else if (es.TransientMove is { } descriptor
+                            && es.NextMoveId == descriptor.MoveId && transient is not null)
+                            ReflectionTools.Set(monsterObj, "NextMove", transient);
+                        else
+                            throw new ProtocolException("unsupported_transient_move", es.NextMoveId);
                     }
                 }
 
-                combatEnemies.Add(creature);
+                if (!created) combatEnemies.Add(creature);
             }
 
+            // XuShuxi: Rebuild identity mappings after temporary CreateCreature IDs are replaced.
+            _combatCreaturesById.Clear();
+            object restoredPlayer = ReflectionTools.Get(_player!, "Creature")!;
+            _combatCreaturesById[Convert.ToUInt32(ReflectionTools.Get(restoredPlayer, "CombatId"))] = restoredPlayer;
+            foreach (object restoredEnemy in combatEnemies)
+                _combatCreaturesById[Convert.ToUInt32(ReflectionTools.Get(restoredEnemy, "CombatId"))] = restoredEnemy;
+
             // 9. RNG stream counters
+            string desiredSeed = snap.RunRngStringSeed ?? _reset!.Seed;
+            object runRng = ReflectionTools.Get(_run!, "Rng")!;
+            if (!StringComparer.Ordinal.Equals(ReflectionTools.Get(runRng, "StringSeed"), desiredSeed))
+            {
+                runRng = ReflectionTools.Create(T("MegaCrit.Sts2.Core.Runs.RunRngSet"), desiredSeed);
+                ReflectionTools.Set(_run!, "Rng", runRng);
+            }
             ApplyRngCountersMap(snap.RngCounters);
+            // XuShuxi: The native RunRng setter rejects an existing owner. Rebind its
+            // exact base-class field directly; private fields are not inherited by reflection.
+            Type runRngType = T("MegaCrit.Sts2.Core.Runs.RunRngSet");
+            FieldInfo owner = T("MegaCrit.Sts2.Core.Models.MonsterModel").GetField("_runRng", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new ProtocolException("unsupported_monster_rng_owner", "Missing MonsterModel._runRng.");
+            if (owner.FieldType != runRngType || owner.IsInitOnly)
+                throw new ProtocolException("unsupported_monster_rng_owner", "MonsterModel._runRng ABI mismatch.");
+            foreach (object? creature in ReflectionTools.Enumerate(ReflectionTools.Get(_combat, "Enemies")))
+                if (creature is not null && ReflectionTools.Get(creature, "Monster") is { } monster)
+                {
+                    owner.SetValue(monster, runRng);
+                    if (!ReferenceEquals(ReflectionTools.Get(monster, "RunRng"), runRng))
+                        throw new ProtocolException("monster_rng_rebind_failed", "Resident monster retained another RunRngSet.");
+                }
 
             // 10. Combat parameters & Manager rebind
             ReflectionTools.Set(_combat, "RoundNumber", snap.RoundNumber);
@@ -3071,6 +4185,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
 
             return true;
         }
+        catch (ProtocolException) { throw; } // Saved-property transport errors must fail closed.
         catch (Exception ex)
         {
             _lastSnapshotDebug = $"restore_ex: {ex.GetType().Name}: {ex.Message} at {ex.StackTrace}";
@@ -3097,20 +4212,32 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         if (props is null || props.Count == 0) return;
         foreach ((string name, object? value) in props)
         {
-            if (value is null) continue;
-            PropertyInfo? property = model.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            if (property is null || !property.CanWrite) continue;
+            PropertyInfo property = model.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new ProtocolException("unsupported_saved_property", $"{model.GetType().Name} has no saved property '{name}'.");
+            if (!property.CanWrite || !property.GetCustomAttributes(true).Any(x => x.GetType().Name == "SavedPropertyAttribute"))
+                throw new ProtocolException("unsupported_saved_property", $"{model.GetType().Name}.{name} is not a writable native [SavedProperty].");
+            Type type = property.PropertyType;
+            if (type != typeof(int) && type != typeof(bool) && type != typeof(string) && type != typeof(int[]))
+                throw new ProtocolException("unsupported_saved_property", $"Saved property type {type.Name} is not supported.");
             try
             {
-                object converted = property.PropertyType == typeof(int) ? Convert.ToInt32(value)
-                    : property.PropertyType == typeof(bool) ? Convert.ToBoolean(value)
-                    : property.PropertyType == typeof(string) ? Convert.ToString(value)!
-                    : property.PropertyType == typeof(decimal) ? Convert.ToDecimal(value)
-                    : property.PropertyType.IsEnum ? Enum.ToObject(property.PropertyType, Convert.ToInt32(value))
-                    : value;
+                // XuShuxi: Only the four existing SavedNativeState value types cross JSON.
+                object? converted = value is JsonElement json
+                    ? type == typeof(int) ? json.GetInt32()
+                        : type == typeof(bool) ? json.GetBoolean()
+                        : type == typeof(string) ? json.GetString()
+                        : json.EnumerateArray().Select(x => x.GetInt32()).ToArray()
+                    : type == typeof(int) ? Convert.ToInt32(value)
+                        : type == typeof(bool) ? Convert.ToBoolean(value)
+                        : type == typeof(string) ? Convert.ToString(value)
+                        : value is int[] array ? array
+                        : throw new InvalidCastException("Expected int[].");
                 property.SetValue(model, converted);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                throw new ProtocolException("invalid_saved_property", $"Cannot restore {model.GetType().Name}.{name}: {ex.Message}");
+            }
         }
     }
 
@@ -3119,7 +4246,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         if (countersMap is not { Count: > 0 }) return;
         Type rngType = T("MegaCrit.Sts2.Core.Entities.Rngs.RunRngType");
         object save = ReflectionTools.Create(T("MegaCrit.Sts2.Core.Saves.Runs.SerializableRunRngSet"));
-        ReflectionTools.Set(save, "Seed", _reset!.Seed);
+        ReflectionTools.Set(save, "Seed", (string)ReflectionTools.Get(ReflectionTools.Get(_run!, "Rng")!, "StringSeed")!);
         IDictionary counters = (IDictionary)ReflectionTools.Get(save, "Counters")!;
         foreach ((string name, int count) in countersMap)
         {
@@ -3148,9 +4275,11 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
 
     private sealed record CardSnapshot(
         string InstanceId,
+        uint CombatCardId,
         string ModelId,
         int Upgrades,
         int EnergyCost,
+        bool CostsX,
         int BaseEnergyCost,
         bool HasSingleTurnRetain,
         bool HasSingleTurnSly,
@@ -3163,6 +4292,130 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         string ModelId,
         int Amount,
         IReadOnlyDictionary<string, object?> SavedProperties);
+
+
+    // XuShuxi: Exact native capability only; never included in observation or public hash.
+    private sealed record MonsterRuntimeEntry(string DeclaringType, string MemberName, string TypeIdentity, string Kind, JsonElement Value);
+
+    private static readonly Dictionary<string, string> MonsterRuntimeExcluded = new(StringComparer.Ordinal)
+    {
+        ["MegaCrit.Sts2.Core.Models.Monsters.CeremonialBeast._beastCryState"] = "MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState",
+        ["MegaCrit.Sts2.Core.Models.Monsters.Crusher._background"] = "MegaCrit.Sts2.Core.Nodes.Vfx.Backgrounds.NKaiserCrabBossBackground",
+        ["MegaCrit.Sts2.Core.Models.Monsters.DecimillipedeSegment._deadState"] = "MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState",
+        ["MegaCrit.Sts2.Core.Models.Monsters.LagavulinMatriarch._sleepingVfx"] = "MegaCrit.Sts2.Core.Nodes.Vfx.NSleepingVfx",
+        ["MegaCrit.Sts2.Core.Models.Monsters.Mocks.MockReattachMonster._deadState"] = "MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState",
+        ["MegaCrit.Sts2.Core.Models.Monsters.Queen._amalgam"] = "MegaCrit.Sts2.Core.Entities.Creatures.Creature",
+        ["MegaCrit.Sts2.Core.Models.Monsters.Queen._burnBrightForMeState"] = "MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState",
+        ["MegaCrit.Sts2.Core.Models.Monsters.Queen._enragedState"] = "MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState",
+        ["MegaCrit.Sts2.Core.Models.Monsters.Rocket._background"] = "MegaCrit.Sts2.Core.Nodes.Vfx.Backgrounds.NKaiserCrabBossBackground",
+        ["MegaCrit.Sts2.Core.Models.Monsters.SlumberingBeetle._sleepingVfx"] = "MegaCrit.Sts2.Core.Nodes.Vfx.NSleepingVfx",
+        ["MegaCrit.Sts2.Core.Models.Monsters.TerrorEel._terrorState"] = "MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState",
+        ["MegaCrit.Sts2.Core.Models.Monsters.TestSubject._deadState"] = "MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState",
+        ["MegaCrit.Sts2.Core.Models.Monsters.ToughEgg._afterHatchedState"] = "MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MonsterState",
+        ["MegaCrit.Sts2.Core.Models.Monsters.ToughEgg._hatchPos"] = "System.Nullable`1[[Godot.Vector2, GodotSharp, Version=4.5.1.0, Culture=neutral, PublicKeyToken=null]]",
+        ["MegaCrit.Sts2.Core.Models.Monsters.Vantom._scaleTween"] = "Godot.Tween",
+        ["MegaCrit.Sts2.Core.Models.Monsters.WaterfallGiant._aboutToBlowState"] = "MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState",
+    };
+
+    private static bool MonsterScalar(Type type)
+    {
+        type = Nullable.GetUnderlyingType(type) ?? type;
+        return type.IsEnum || type == typeof(bool) || type == typeof(sbyte) || type == typeof(byte)
+            || type == typeof(short) || type == typeof(ushort) || type == typeof(int) || type == typeof(uint)
+            || type == typeof(long) || type == typeof(ulong) || type == typeof(float) || type == typeof(double)
+            || type == typeof(decimal) || type == typeof(string);
+    }
+
+    private IEnumerable<(FieldInfo Field, string Kind)> MonsterRuntimeFields(Type runtime)
+    {
+        Type root = T("MegaCrit.Sts2.Core.Models.MonsterModel");
+        // XuShuxi: The exact base ABI has separate owners; reject new unclassified instance fields.
+        string[] baseOwned = ["_rng", "_runRng", "_creature", "_moveStateMachine", "<NextMove>k__BackingField", "_canonicalInstance", "_spawnedThisTurn", "_isPerformingMove"];
+        foreach (FieldInfo field in root.GetFields(BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            if (!field.IsInitOnly && !baseOwned.Contains(field.Name, StringComparer.Ordinal))
+                throw new ProtocolException("unsupported_combat_root", $"Unclassified MonsterModel base field {field.Name}.");
+        for (Type? type = runtime; type is not null && type != root; type = type.BaseType)
+            foreach (FieldInfo field in type.GetFields(BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic).OrderBy(f => f.Name, StringComparer.Ordinal))
+            {
+                if (field.IsInitOnly || field.IsLiteral) continue;
+                if (MonsterScalar(field.FieldType)) { yield return (field, "scalar"); continue; }
+                string key = type.Name + "." + field.Name;
+                if (type.FullName == "MegaCrit.Sts2.Core.Models.Monsters.Fabricator" && key == "Fabricator._lastSpawned" && field.FieldType == root)
+                { yield return (field, "monster_model_ref"); continue; }
+                if (MonsterRuntimeExcluded.TryGetValue(type.FullName + "." + field.Name, out string? excludedType) && excludedType == field.FieldType.FullName) continue;
+                throw new ProtocolException("unsupported_combat_root", $"Unsupported monster runtime field {type.FullName}.{field.Name}: {field.FieldType.FullName}.");
+            }
+        FieldInfo spawned = root.GetField("_spawnedThisTurn", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new ProtocolException("unsupported_combat_root", "Missing MonsterModel._spawnedThisTurn.");
+        if (spawned.FieldType != typeof(bool)) throw new ProtocolException("unsupported_combat_root", "SpawnedThisTurn ABI mismatch.");
+        yield return (spawned, "scalar");
+    }
+
+    // XuShuxi: A resident/fallback public-hash match cannot stand in for private monster equality.
+    private bool MonsterFingerprintMatches(CombatSnapshot expected)
+    {
+        CombatSnapshot? actual = CaptureCombatSnapshot();
+        return actual is not null && JsonSerializer.Serialize(expected.Enemies, PortableRootJson)
+            == JsonSerializer.Serialize(actual.Enemies, PortableRootJson);
+    }
+
+    private List<MonsterRuntimeEntry> CaptureMonsterRuntimeState(object monster)
+    {
+        if (Convert.ToBoolean(ReflectionTools.Get(monster, "IsPerformingMove")))
+            throw new ProtocolException("unsupported_combat_root", "Monster is performing a move.");
+        var result = new List<MonsterRuntimeEntry>();
+        foreach ((FieldInfo field, string kind) in MonsterRuntimeFields(monster.GetType()))
+        {
+            object? value = field.GetValue(monster);
+            JsonElement encoded;
+            if (kind == "monster_model_ref")
+            {
+                string? id = value is null ? null : Entry(value);
+                if (value is not null && !ReferenceEquals(value, Find(ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Models.ModelDb"), "Monsters")!, id!)))
+                    throw new ProtocolException("unsupported_combat_root", "MonsterModelRef must reference the canonical model.");
+                encoded = JsonSerializer.SerializeToElement(id);
+            }
+            else encoded = JsonSerializer.SerializeToElement(value, field.FieldType);
+            result.Add(new(field.DeclaringType!.FullName!, field.Name, field.FieldType.FullName!, kind, encoded));
+        }
+        return result;
+    }
+
+    private void ApplyMonsterRuntimeState(object monster, List<MonsterRuntimeEntry>? entries)
+    {
+        if (entries is null) throw new ProtocolException("unsupported_combat_root", "Missing monster runtime state.");
+        var fields = MonsterRuntimeFields(monster.GetType()).ToArray();
+        if (entries.Count != fields.Length) throw new ProtocolException("unsupported_combat_root", "Monster runtime member count mismatch.");
+        // XuShuxi: Validate complete identity/type coverage before writing; no best-effort or object-graph codec.
+        var decoded = new List<(FieldInfo Field, object? Value)>();
+        for (int i = 0; i < fields.Length; i++)
+        {
+            (FieldInfo field, string kind) = fields[i]; MonsterRuntimeEntry entry = entries[i];
+            if (entry.DeclaringType != field.DeclaringType!.FullName || entry.MemberName != field.Name || entry.TypeIdentity != field.FieldType.FullName || entry.Kind != kind)
+                throw new ProtocolException("unsupported_combat_root", "Monster runtime member identity mismatch.");
+            object? value;
+            try
+            {
+                value = kind == "monster_model_ref"
+                    ? entry.Value.ValueKind == JsonValueKind.Null ? null : Find(ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Models.ModelDb"), "Monsters")!, entry.Value.GetString()!)
+                    : entry.Value.Deserialize(field.FieldType);
+            }
+            catch (Exception ex) { throw new ProtocolException("unsupported_combat_root", $"Invalid monster runtime value: {ex.Message}"); }
+            decoded.Add((field, value));
+        }
+        foreach ((FieldInfo field, object? value) in decoded) field.SetValue(monster, value);
+        if (Convert.ToBoolean(ReflectionTools.Get(monster, "IsPerformingMove")))
+            throw new ProtocolException("unsupported_combat_root", "Imported monster is performing a move.");
+    }
+
+    // XuShuxi: This exact-DLL descriptor preserves a runtime-created move's
+    // behavior without serializing a delegate or executing the move on restore.
+    internal sealed record ImmediateRuleSnapshot(
+        uint CombatId, string DestinationMoveId, string? TriggerMoveId, string SourceMethod);
+
+    private sealed record TransientMoveSnapshot(
+        string MoveId, string FollowUpStateId, bool MustPerformOnce, bool PerformedAtLeastOnce,
+        string BehaviorOwner, string? BehaviorMethod, int? PowerIndex, string[] IntentTypeNames);
 
     private sealed record EnemySnapshot(
         string ModelId,
@@ -3177,7 +4430,9 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         List<string> StateLog,
         int MonsterRngCounter,
         uint MonsterRngSeed,
-        string? NextMoveId);
+        string? NextMoveId,
+        List<MonsterRuntimeEntry>? MonsterRuntimeState = null,
+        TransientMoveSnapshot? TransientMove = null);
 
     private sealed record RelicSnapshot(
         string ModelId,
@@ -3206,6 +4461,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         int RoundNumber,
         string CurrentSide,
         uint NextCreatureId,
+        uint NextCardId,
         int DynamicCardOrdinal,
         Dictionary<string, int> RngCounters,
         List<CardSnapshot> Hand,
@@ -3217,7 +4473,8 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         List<EnemySnapshot> Enemies,
         List<RelicSnapshot> Relics,
         List<string?> PotionSlots,
-        OrbQueueSnapshot? Orbs);
+        OrbQueueSnapshot? Orbs,
+        string? RunRngStringSeed = null);
 
     private sealed record Branch(
         string? ParentHandle,
