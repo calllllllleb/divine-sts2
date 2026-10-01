@@ -4162,11 +4162,24 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
 
             // 8. Enemies
             IList combatEnemies = (IList)ReflectionTools.Get(_combat, "_enemies")!;
+            // XuShuxi: The identity cache outlives enemy removal/terminal cleanup.
+            // Capture real ownership before clearing; removed objects have torn-down FSMs.
+            object[] residentEnemies = combatEnemies.Cast<object>().ToArray();
             combatEnemies.Clear();
             foreach (EnemySnapshot es in snap.Enemies)
             {
                 bool created = false;
-                if (!_combatCreaturesById.TryGetValue(es.CombatId, out object? creature))
+                _combatCreaturesById.TryGetValue(es.CombatId, out object? creature);
+                object? cachedMonster = creature is null ? null : ReflectionTools.Get(creature, "Monster");
+                bool reusable = creature is not null
+                    && residentEnemies.Any(enemy => ReferenceEquals(enemy, creature))
+                    && ReferenceEquals(ReflectionTools.Get(creature, "CombatState"), _combat)
+                    && Convert.ToUInt32(ReflectionTools.Get(creature, "CombatId")) == es.CombatId
+                    && cachedMonster is not null
+                    && ReferenceEquals(ReflectionTools.Get(cachedMonster, "Creature"), creature)
+                    && StringComparer.OrdinalIgnoreCase.Equals(Entry(cachedMonster), es.ModelId)
+                    && (es.CurrentHp <= 0 || Convert.ToInt32(ReflectionTools.Get(creature, "CurrentHp")) > 0);
+                if (!reusable || creature is null)
                 {
                     object monster = Mutable("Monsters", es.ModelId);
                     ApplyMonsterRuntimeState(monster, es.MonsterRuntimeState);
