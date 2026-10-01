@@ -3798,6 +3798,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                     bool exhaust = Convert.ToBoolean(ReflectionTools.Get(card, "_exhaustOnNextPlay") ?? false);
                     string? enchModel = ReflectionTools.Get(card, "Enchantment") is { } ench ? Entry(ench) : null;
                     decimal enchAmount = ReflectionTools.Get(card, "Enchantment") is { } ench2 ? Convert.ToDecimal(ReflectionTools.Get(ench2, "Amount")) : 0m;
+                    object? affliction = ReflectionTools.Get(card, "Affliction");
                     var savedProps = SavedNativeState(card);
                     list.Add(new CardSnapshot(
                         instanceId,
@@ -3812,7 +3813,10 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                         exhaust,
                         enchModel,
                         enchAmount,
-                        savedProps
+                        savedProps,
+                        affliction is null ? null : Entry(affliction),
+                        affliction is null ? 0 : Convert.ToInt32(ReflectionTools.Get(affliction, "Amount")),
+                        affliction is null ? null : SavedNativeState(affliction)
                     ));
                 }
                 return list;
@@ -4005,6 +4009,10 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             // 1. Player creature stats
             object playerCreature = ReflectionTools.Get(_player, "Creature")!;
             ReflectionTools.Set(playerCreature, "CurrentHp", snap.PlayerHp);
+            // XuShuxi: Death deactivates player hooks independently of HP. Restoring
+            // a quiescent alive snapshot must undo that branch-local lifecycle flag;
+            // the native CurrentHp setter does not reactivate hooks.
+            ReflectionTools.Set(_player, "IsActiveForHooks", snap.PlayerHp > 0);
             ReflectionTools.Set(playerCreature, "MaxHp", snap.PlayerMaxHp);
             ReflectionTools.Set(playerCreature, "Block", snap.PlayerBlock);
             ReflectionTools.Set(_player, "Gold", snap.Gold);
@@ -4057,6 +4065,15 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                     {
                         object enchantment = Mutable("DebugEnchantments", cs.EnchantmentModelId);
                         ReflectionTools.Invoke(nativeCard, "EnchantInternal", enchantment, cs.EnchantmentAmount);
+                    }
+                    // XuShuxi: Restore combat-only afflictions as exact card-owned state,
+                    // including clearing mutations left by another resident branch.
+                    ReflectionTools.Invoke(nativeCard, "ClearAfflictionInternal");
+                    if (cs.AfflictionModelId is not null)
+                    {
+                        object affliction = Mutable("DebugAfflictions", cs.AfflictionModelId);
+                        ApplyNativeProperties(affliction, cs.AfflictionSavedProperties);
+                        ReflectionTools.Invoke(nativeCard, "AfflictInternal", affliction, (decimal)cs.AfflictionAmount);
                     }
                     int curUpgrades = Convert.ToInt32(ReflectionTools.Get(nativeCard, "CurrentUpgradeLevel"));
                     for (int u = curUpgrades; u < cs.Upgrades; u++)
@@ -4369,7 +4386,10 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         bool ExhaustOnNextPlay,
         string? EnchantmentModelId,
         decimal EnchantmentAmount,
-        IReadOnlyDictionary<string, object?> SavedProperties);
+        IReadOnlyDictionary<string, object?> SavedProperties,
+        string? AfflictionModelId = null,
+        int AfflictionAmount = 0,
+        IReadOnlyDictionary<string, object?>? AfflictionSavedProperties = null);
 
     private sealed record PowerSnapshot(
         string ModelId,
