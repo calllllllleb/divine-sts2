@@ -1833,30 +1833,110 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
 
     private EnvironmentResult CaptureMap(object? transition)
     {
-        EnsureReset(); object map = ReflectionTools.Get(_run!, "Map")!, rng = ReflectionTools.Get(_run!, "Rng")!;
-        object Coord(object point)
+        EnsureReset();
+        object map = ReflectionTools.Get(_run!, "Map")!;
+        object deck = ReflectionTools.Get(_player!, "Deck")!;
+        object act = ReflectionTools.Get(_run!, "Act")!;
+        object? startingPoint = ReflectionTools.Get(map, "StartingMapPoint");
+        object? bossPoint = ReflectionTools.Get(map, "BossMapPoint");
+        object? secondBossPoint = ReflectionTools.Get(map, "SecondBossMapPoint");
+        object? bossEncounter = ReflectionTools.Get(act, "BossEncounter");
+        object? secondBossEncounter = ReflectionTools.Get(act, "SecondBossEncounter");
+
+        static string CoordKey(int col, int row) => $"{col}:{row}";
+        (int Col, int Row) PointCoord(object point)
         {
             object coord = ReflectionTools.Get(point, "coord")!;
-            return new { col = ReflectionTools.Get(coord, "col"), row = ReflectionTools.Get(coord, "row") };
+            return (Convert.ToInt32(ReflectionTools.Get(coord, "col")), Convert.ToInt32(ReflectionTools.Get(coord, "row")));
         }
-        object[] points = ReflectionTools.Enumerate(ReflectionTools.Invoke(map, "GetAllMapPoints"))
-            .Where(point => point is not null).Select(point => point!).Select(point => new
+        object Coord(object point)
+        {
+            (int col, int row) = PointCoord(point);
+            return new { col, row };
+        }
+        bool SamePoint(object? left, object? right)
+            => left is not null && right is not null && PointCoord(left) == PointCoord(right);
+
+        HashSet<string> visitedKeys = ReflectionTools.Enumerate(ReflectionTools.Get(_run!, "_visitedMapCoords"))
+            .Where(coord => coord is not null)
+            .Select(coord => CoordKey(
+                Convert.ToInt32(ReflectionTools.Get(coord!, "col")),
+                Convert.ToInt32(ReflectionTools.Get(coord!, "row"))))
+            .ToHashSet(StringComparer.Ordinal);
+
+        object[] actHistories = ReflectionTools.Enumerate(ReflectionTools.Get(_run!, "MapPointHistory"))
+            .Where(history => history is not null).Select(history => history!).ToArray();
+        int currentActIndex = Convert.ToInt32(ReflectionTools.Get(_run!, "CurrentActIndex"));
+
+        string? RevealedRoomType(object point)
+        {
+            (int col, int row) = PointCoord(point);
+            if (!visitedKeys.Contains(CoordKey(col, row)) || row < 0 || currentActIndex < 0 || currentActIndex >= actHistories.Length)
+                return null;
+            object[] history = ReflectionTools.Enumerate(actHistories[currentActIndex])
+                .Where(entry => entry is not null).Select(entry => entry!).ToArray();
+            if (row >= history.Length) return null;
+            object[] rooms = ReflectionTools.Enumerate(ReflectionTools.Get(history[row], "Rooms"))
+                .Where(room => room is not null).Select(room => room!).ToArray();
+            return rooms.Length == 0 ? null : ReflectionTools.Get(rooms[0], "RoomType")?.ToString();
+        }
+
+        List<object> allPoints = ReflectionTools.Enumerate(ReflectionTools.Invoke(map, "GetAllMapPoints"))
+            .Where(point => point is not null).Select(point => point!).ToList();
+        foreach (object? special in new[] { startingPoint, bossPoint, secondBossPoint })
+        {
+            if (special is null) continue;
+            (int col, int row) = PointCoord(special);
+            if (!allPoints.Any(point => PointCoord(point) == (col, row))) allPoints.Add(special);
+        }
+
+        object? currentPoint = ReflectionTools.Get(_run!, "CurrentMapPoint");
+        object[] points = allPoints
+            .OrderBy(point => PointCoord(point).Row)
+            .ThenBy(point => PointCoord(point).Col)
+            .Select(point =>
             {
-                coord = Coord(point), point_type = ReflectionTools.Get(point, "PointType")!.ToString(),
-                children = ReflectionTools.Enumerate(ReflectionTools.Get(point, "Children")).Where(child => child is not null).Select(child => Coord(child!)).ToArray()
-            }).OrderBy(point => Convert.ToInt32(ReflectionTools.Get(point.coord, "row"))).ThenBy(point => Convert.ToInt32(ReflectionTools.Get(point.coord, "col"))).ToArray();
-        object[] visited = ReflectionTools.Enumerate(ReflectionTools.Get(_run!, "_visitedMapCoords")).Where(coord => coord is not null).Select(coord => new { col = ReflectionTools.Get(coord!, "col"), row = ReflectionTools.Get(coord!, "row") }).ToArray();
+                (int col, int row) = PointCoord(point);
+                bool visited = visitedKeys.Contains(CoordKey(col, row));
+                string? bossEncounterModelId = SamePoint(point, bossPoint) && bossEncounter is not null
+                    ? Entry(bossEncounter)
+                    : SamePoint(point, secondBossPoint) && secondBossEncounter is not null
+                        ? Entry(secondBossEncounter)
+                        : null;
+                return (object)new
+                {
+                    coord = new { col, row },
+                    point_type = ReflectionTools.Get(point, "PointType")!.ToString(),
+                    children = ReflectionTools.Enumerate(ReflectionTools.Get(point, "Children"))
+                        .Where(child => child is not null).Select(child => Coord(child!)).ToArray(),
+                    visited,
+                    current = SamePoint(point, currentPoint),
+                    revealed_room_type = visited ? RevealedRoomType(point) : null,
+                    has_quest_marker = ReflectionTools.Enumerate(ReflectionTools.Get(point, "Quests")).Any(quest => quest is not null),
+                    boss_encounter_model_id = bossEncounterModelId
+                };
+            }).ToArray();
+
+        object[] visitedCoords = ReflectionTools.Enumerate(ReflectionTools.Get(_run!, "_visitedMapCoords"))
+            .Where(coord => coord is not null)
+            .Select(coord => new
+            {
+                col = ReflectionTools.Get(coord!, "col"),
+                row = ReflectionTools.Get(coord!, "row")
+            }).ToArray();
         LegalAction[] actions = BuildMapActions().ToArray();
         object observation = new
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = new { seed = ReflectionTools.Get(rng, "StringSeed"), ascension = _reset!.Ascension, act_index = ReflectionTools.Get(_run!, "CurrentActIndex"), act_floor = ReflectionTools.Get(_run!, "ActFloor"), rng_counters = RunRngCounters() },
-            map = new { points, visited, current = ReflectionTools.Get(_run!, "CurrentMapPoint") is { } current ? Coord(current) : null },
+            run = RunInventorySnapshot(deck),
+            map = new { points, visited = visitedCoords, current = currentPoint is null ? null : Coord(currentPoint) },
             decision = new { kind = actions.Length == 0 ? "map_terminal" : "map_choice", legal_actions = actions },
-            terminal = actions.Length == 0, victory = false
+            terminal = actions.Length == 0,
+            victory = false
         };
-        _hash = ComputeStateHash(observation); string handle = GetOrAddCurrentBranch();
+        _hash = ComputeStateHash(observation);
+        string handle = GetOrAddCurrentBranch();
         return new(observation, _hash, actions, actions.Length == 0, false, handle, transition, ScoringFeatures());
     }
 
@@ -1977,21 +2057,42 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
 
     private EnvironmentResult CaptureReward(object? transition)
     {
-        EnsureReset(); LegalAction[] actions = BuildRewardActions().ToArray(); object deck = ReflectionTools.Get(_player!, "Deck")!;
-        object[] options = _cardReward is null ? [] : _rewardKind == "card"
-            ? ReflectionTools.Enumerate(ReflectionTools.Get(_cardReward, "Cards")).Where(card => card is not null).Select((card, index) => new { option_id = $"reward-{index}-{Entry(card!)}", model_id = Entry(card!) }).Cast<object>().ToArray()
-            : [new { option_id = $"reward-0-{Entry(ReflectionTools.Get(_cardReward, _rewardKind == "relic" ? "Relic" : "Potion")!)}", model_id = Entry(ReflectionTools.Get(_cardReward, _rewardKind == "relic" ? "Relic" : "Potion")!) }];
+        EnsureReset();
+        LegalAction[] actions = BuildRewardActions().ToArray();
+        object deck = ReflectionTools.Get(_player!, "Deck")!;
+        object[] options = _cardReward is null
+            ? []
+            : _rewardKind == "card"
+                ? ReflectionTools.Enumerate(ReflectionTools.Get(_cardReward, "Cards"))
+                    .Where(card => card is not null)
+                    .Select((card, index) => (object)new
+                    {
+                        option_id = $"reward-{index}-{Entry(card!)}",
+                        model_id = Entry(card!),
+                        card = PublicCardFace(card!)
+                    }).ToArray()
+                : [new
+                {
+                    option_id = $"reward-0-{Entry(ReflectionTools.Get(_cardReward, _rewardKind == "relic" ? "Relic" : "Potion")!)}",
+                    model_id = Entry(ReflectionTools.Get(_cardReward, _rewardKind == "relic" ? "Relic" : "Potion")!)
+                }];
         object observation = new
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = new { seed = _reset!.Seed, ascension = _reset.Ascension, gold = ReflectionTools.Get(_player!, "Gold"), rng_counters = RunRngCounters(), deck = ReflectionTools.Enumerate(ReflectionTools.Get(deck, "Cards")).Where(card => card is not null).Select(card => Entry(card!)).ToArray(), relics = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "Relics")).Where(relic => relic is not null).Select(relic => Entry(relic!)).ToArray(), potions = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "PotionSlots")).Select(potion => potion is null ? null : Entry(potion)).ToArray() },
+            run = RunInventorySnapshot(deck),
             reward = new { kind = _rewardKind, options, can_skip = true, selected = _rewardCompleted },
             outstanding_choice = _pendingChoice?.Snapshot(),
-            decision = new { kind = _pendingChoice is not null ? _pendingChoice.DecisionKind : actions.Length == 0 ? "reward_complete" : "reward_choice", legal_actions = actions },
-            terminal = false, victory = false
+            decision = new
+            {
+                kind = _pendingChoice is not null ? _pendingChoice.DecisionKind : actions.Length == 0 ? "reward_complete" : "reward_choice",
+                legal_actions = actions
+            },
+            terminal = false,
+            victory = false
         };
-        _hash = ComputeStateHash(observation); string handle = GetOrAddCurrentBranch();
+        _hash = ComputeStateHash(observation);
+        string handle = GetOrAddCurrentBranch();
         return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
@@ -2029,29 +2130,37 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
 
     private EnvironmentResult CaptureRest(object? transition)
     {
-        EnsureReset(); LegalAction[] actions = BuildRestActions().ToArray(); object deck = ReflectionTools.Get(_player!, "Deck")!;
+        EnsureReset();
+        LegalAction[] actions = BuildRestActions().ToArray();
+        object deck = ReflectionTools.Get(_player!, "Deck")!;
         object[] options = _restOptions.Select(option => new
         {
-            option_id = ReflectionTools.Get(option, "OptionId"), enabled = ReflectionTools.Get(option, "IsEnabled"), implementation = option.GetType().Name
+            option_id = ReflectionTools.Get(option, "OptionId"),
+            enabled = ReflectionTools.Get(option, "IsEnabled"),
+            implementation = option.GetType().Name
         }).ToArray();
         object? choice = _pendingChoice?.Snapshot();
         object observation = new
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = new
-            {
-                seed = _reset!.Seed, ascension = _reset.Ascension, rng_counters = RunRngCounters(),
-                current_hp = ReflectionTools.Get(ReflectionTools.Get(_player!, "Creature")!, "CurrentHp"),
-                max_hp = ReflectionTools.Get(ReflectionTools.Get(_player!, "Creature")!, "MaxHp"),
-                deck = ReflectionTools.Enumerate(ReflectionTools.Get(deck, "Cards")).Where(card => card is not null).Select(card => new { model_id = Entry(card!), upgrades = ReflectionTools.Get(card!, "CurrentUpgradeLevel") }).ToArray()
-            },
+            run = RunInventorySnapshot(deck),
             rest_site = new { options, selected = _restSelectionStarted && _pendingChoice is null },
-            outstanding_choice = choice, outstanding_rewards = CustomRewardsSnapshot(),
-            decision = new { kind = _pendingRewardsSet is not null ? "custom_reward_choice" : _pendingChoice is not null ? _pendingChoice.DecisionKind : _restSelectionStarted ? "rest_complete" : "rest_choice", legal_actions = actions },
-            terminal = false, victory = false
+            outstanding_choice = choice,
+            outstanding_rewards = CustomRewardsSnapshot(),
+            decision = new
+            {
+                kind = _pendingRewardsSet is not null ? "custom_reward_choice"
+                    : _pendingChoice is not null ? _pendingChoice.DecisionKind
+                    : _restSelectionStarted ? "rest_complete"
+                    : "rest_choice",
+                legal_actions = actions
+            },
+            terminal = false,
+            victory = false
         };
-        _hash = ComputeStateHash(observation); string handle = GetOrAddCurrentBranch();
+        _hash = ComputeStateHash(observation);
+        string handle = GetOrAddCurrentBranch();
         return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
@@ -2160,31 +2269,37 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         EnsureReset();
         if (_event is null) throw new ProtocolException("invalid_state", "Event mode has no native event instance.");
         LegalAction[] actions = BuildEventActions().ToArray();
-        object creature = ReflectionTools.Get(_player!, "Creature")!, deck = ReflectionTools.Get(_player!, "Deck")!;
+        object deck = ReflectionTools.Get(_player!, "Deck")!;
         object[] options = ReflectionTools.Enumerate(ReflectionTools.Get(_event, "CurrentOptions")).Select((option, index) => option is null ? null : new
         {
-            option_index = index, text_key = ReflectionTools.Get(option, "TextKey"), locked = ReflectionTools.Get(option, "IsLocked"),
-            chosen = ReflectionTools.Get(option, "WasChosen"), is_proceed = ReflectionTools.Get(option, "IsProceed")
+            option_index = index,
+            text_key = ReflectionTools.Get(option, "TextKey"),
+            locked = ReflectionTools.Get(option, "IsLocked"),
+            chosen = ReflectionTools.Get(option, "WasChosen"),
+            is_proceed = ReflectionTools.Get(option, "IsProceed")
         }).Where(option => option is not null).ToArray()!;
         bool finished = (bool)ReflectionTools.Get(_event, "IsFinished")!;
         object observation = new
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = new
-            {
-                seed = _reset!.Seed, ascension = _reset.Ascension, gold = ReflectionTools.Get(_player!, "Gold"), rng_counters = RunRngCounters(),
-                current_hp = ReflectionTools.Get(creature, "CurrentHp"), max_hp = ReflectionTools.Get(creature, "MaxHp"),
-                deck = ReflectionTools.Enumerate(ReflectionTools.Get(deck, "Cards")).Where(card => card is not null).Select(card => new { model_id = Entry(card!), upgrades = ReflectionTools.Get(card!, "CurrentUpgradeLevel") }).ToArray(),
-                relics = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "Relics")).Where(relic => relic is not null).Select(relic => Entry(relic!)).ToArray(),
-                potions = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "PotionSlots")).Select(potion => potion is null ? null : Entry(potion)).ToArray()
-            },
+            run = RunInventorySnapshot(deck),
             @event = new { model_id = _eventId, options, finished },
-            outstanding_choice = _pendingChoice?.Snapshot(), outstanding_rewards = CustomRewardsSnapshot(),
-            decision = new { kind = _pendingRewardsSet is not null ? "custom_reward_choice" : _pendingChoice is not null ? _pendingChoice.DecisionKind : finished ? "event_complete" : "event_choice", legal_actions = actions },
-            terminal = false, victory = false
+            outstanding_choice = _pendingChoice?.Snapshot(),
+            outstanding_rewards = CustomRewardsSnapshot(),
+            decision = new
+            {
+                kind = _pendingRewardsSet is not null ? "custom_reward_choice"
+                    : _pendingChoice is not null ? _pendingChoice.DecisionKind
+                    : finished ? "event_complete"
+                    : "event_choice",
+                legal_actions = actions
+            },
+            terminal = false,
+            victory = false
         };
-        _hash = ComputeStateHash(observation); string handle = GetOrAddCurrentBranch();
+        _hash = ComputeStateHash(observation);
+        string handle = GetOrAddCurrentBranch();
         return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
@@ -2246,27 +2361,70 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     {
         if (_roomRewardsSet is null) return [];
         List<LegalAction> actions = [];
-        object[] rewards = ReflectionTools.Enumerate(ReflectionTools.Get(_roomRewardsSet, "Rewards")).Where(reward => reward is not null).Select(reward => reward!).ToArray();
+        object[] rewards = ReflectionTools.Enumerate(ReflectionTools.Get(_roomRewardsSet, "Rewards"))
+            .Where(reward => reward is not null).Select(reward => reward!).ToArray();
         for (int rewardIndex = 0; rewardIndex < rewards.Length; rewardIndex++)
         {
             object reward = rewards[rewardIndex];
             if (_resolvedRoomRewards.Contains(rewardIndex) || (bool)ReflectionTools.Get(reward, "SuccessfullySelected")!) continue;
             if (reward.GetType().Name == "CardReward")
             {
-                object[] cards = ReflectionTools.Enumerate(ReflectionTools.Get(reward, "Cards")).Where(card => card is not null).Select(card => card!).ToArray();
+                object[] cards = ReflectionTools.Enumerate(ReflectionTools.Get(reward, "Cards"))
+                    .Where(card => card is not null).Select(card => card!).ToArray();
                 for (int optionIndex = 0; optionIndex < cards.Length; optionIndex++)
                 {
                     string modelId = Entry(cards[optionIndex]);
-                    actions.Add(new($"choose_room_reward:{rewardIndex}:card:{optionIndex}:{modelId}", "choose_room_reward", new Dictionary<string, object?> { ["reward_index"] = rewardIndex, ["option_index"] = optionIndex, ["reward_kind"] = "card", ["model_id"] = modelId }));
+                    actions.Add(new(
+                        $"choose_room_reward:{rewardIndex}:card:{optionIndex}:{modelId}",
+                        "choose_room_reward",
+                        new Dictionary<string, object?>
+                        {
+                            ["reward_index"] = rewardIndex,
+                            ["option_index"] = optionIndex,
+                            ["reward_kind"] = "card",
+                            ["model_id"] = modelId
+                        }));
                 }
+            }
+            else if (SpecialRewardCard(reward) is { } specialCard)
+            {
+                string modelId = Entry(specialCard);
+                actions.Add(new(
+                    $"choose_room_reward:{rewardIndex}:special_card:0:{modelId}",
+                    "choose_room_reward",
+                    new Dictionary<string, object?>
+                    {
+                        ["reward_index"] = rewardIndex,
+                        ["option_index"] = 0,
+                        ["reward_kind"] = "special_card",
+                        ["model_id"] = modelId
+                    }));
             }
             else
             {
                 object? model = ReflectionTools.Get(reward, "Relic") ?? ReflectionTools.Get(reward, "Potion");
                 string kind = reward.GetType().Name.Replace("Reward", "", StringComparison.Ordinal).ToLowerInvariant();
-                actions.Add(new($"choose_room_reward:{rewardIndex}:take", "choose_room_reward", new Dictionary<string, object?> { ["reward_index"] = rewardIndex, ["option_index"] = 0, ["reward_kind"] = kind, ["model_id"] = model is null ? null : Entry(model) }));
+                actions.Add(new(
+                    $"choose_room_reward:{rewardIndex}:take",
+                    "choose_room_reward",
+                    new Dictionary<string, object?>
+                    {
+                        ["reward_index"] = rewardIndex,
+                        ["option_index"] = 0,
+                        ["reward_kind"] = kind,
+                        ["model_id"] = model is null ? null : Entry(model)
+                    }));
             }
-            actions.Add(new($"choose_room_reward:{rewardIndex}:skip", "choose_room_reward", new Dictionary<string, object?> { ["reward_index"] = rewardIndex, ["option_index"] = -1, ["reward_kind"] = reward.GetType().Name, ["model_id"] = null }));
+            actions.Add(new(
+                $"choose_room_reward:{rewardIndex}:skip",
+                "choose_room_reward",
+                new Dictionary<string, object?>
+                {
+                    ["reward_index"] = rewardIndex,
+                    ["option_index"] = -1,
+                    ["reward_kind"] = reward.GetType().Name,
+                    ["model_id"] = null
+                }));
         }
         actions.Add(new("leave_room_rewards", "leave_room_rewards", new Dictionary<string, object?>()));
         return actions;
@@ -2543,21 +2701,41 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
 
     private EnvironmentResult CaptureShop(object? transition)
     {
-        EnsureReset(); object deck = ReflectionTools.Get(_player!, "Deck")!;
+        EnsureReset();
+        object deck = ReflectionTools.Get(_player!, "Deck")!;
         object[] entries = MerchantEntries().Select((entry, index) =>
         {
             (string kind, string? modelId) = MerchantEntryIdentity(entry);
-            return (object)new { entry_index = index, kind, model_id = modelId, cost = ReflectionTools.Get(entry, "Cost"), stocked = ReflectionTools.Get(entry, "IsStocked"), enough_gold = ReflectionTools.Get(entry, "EnoughGold") };
+            return (object)new
+            {
+                entry_index = index,
+                kind,
+                model_id = modelId,
+                card = MerchantCardFace(entry),
+                cost = ReflectionTools.Get(entry, "Cost"),
+                stocked = ReflectionTools.Get(entry, "IsStocked"),
+                enough_gold = ReflectionTools.Get(entry, "EnoughGold")
+            };
         }).ToArray();
         LegalAction[] actions = BuildShopActions().ToArray();
         object observation = new
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck), shop = new { entries }, outstanding_choice = _pendingChoice?.Snapshot(), outstanding_rewards = CustomRewardsSnapshot(),
-            decision = new { kind = _pendingRewardsSet is not null ? "custom_reward_choice" : _pendingChoice is null ? "shop_choice" : _pendingChoice.DecisionKind, legal_actions = actions }, terminal = false, victory = false
+            run = RunInventorySnapshot(deck),
+            shop = new { entries },
+            outstanding_choice = _pendingChoice?.Snapshot(),
+            outstanding_rewards = CustomRewardsSnapshot(),
+            decision = new
+            {
+                kind = _pendingRewardsSet is not null ? "custom_reward_choice" : _pendingChoice is null ? "shop_choice" : _pendingChoice.DecisionKind,
+                legal_actions = actions
+            },
+            terminal = false,
+            victory = false
         };
-        _hash = ComputeStateHash(observation); string handle = GetOrAddCurrentBranch();
+        _hash = ComputeStateHash(observation);
+        string handle = GetOrAddCurrentBranch();
         return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
@@ -2577,13 +2755,80 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         throw new ProtocolException("unsupported_shop_entry", $"Native merchant entry '{type}' is not connected.");
     }
 
-    private object RunInventorySnapshot(object deck) => new
+    private object PublicCardFace(object card)
     {
-        seed = _reset!.Seed, ascension = _reset.Ascension, gold = ReflectionTools.Get(_player!, "Gold"), rng_counters = RunRngCounters(),
-        deck = ReflectionTools.Enumerate(ReflectionTools.Get(deck, "Cards")).Where(card => card is not null).Select(card => new { model_id = Entry(card!), upgrades = ReflectionTools.Get(card!, "CurrentUpgradeLevel") }).ToArray(),
-        relics = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "Relics")).Where(relic => relic is not null).Select(relic => Entry(relic!)).ToArray(),
-        potions = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "PotionSlots")).Select(potion => potion is null ? null : Entry(potion)).ToArray()
+        object cost = ReflectionTools.Get(card, "EnergyCost")!;
+        return new
+        {
+            model_id = Entry(card),
+            upgrades = ReflectionTools.Get(card, "CurrentUpgradeLevel"),
+            current_cost = ReflectionTools.Invoke(cost, "GetResolved"),
+            costs_x = ReflectionTools.Get(cost, "CostsX"),
+            enchantment = ReflectionTools.Get(card, "Enchantment") is { } enchantment
+                ? new { model_id = Entry(enchantment), amount = ReflectionTools.Get(enchantment, "Amount") }
+                : null
+        };
+    }
+
+    private object PublicRelicFace(object relic) => new
+    {
+        model_id = Entry(relic),
+        display_amount = Convert.ToBoolean(ReflectionTools.Get(relic, "ShowCounter"))
+            ? Convert.ToInt32(ReflectionTools.Get(relic, "DisplayAmount"))
+            : (int?)null
     };
+
+    private object? MerchantCardFace(object entry)
+    {
+        if (entry.GetType().Name != "MerchantCardEntry") return null;
+        object? creation = ReflectionTools.Get(entry, "CreationResult");
+        object? card = creation is null ? null : ReflectionTools.Get(creation, "Card");
+        return card is null ? null : PublicCardFace(card);
+    }
+
+    private object? SpecialRewardCard(object reward)
+        => reward.GetType().Name == "SpecialCardReward" ? ReflectionTools.Get(reward, "_card") : null;
+
+    private int? RewardAmount(object reward)
+        => reward.GetType().Name == "GoldReward" ? Convert.ToInt32(ReflectionTools.Get(reward, "Amount")) : null;
+
+    private object[] RewardOptionsSnapshot(object reward)
+    {
+        if (reward.GetType().Name == "CardReward")
+            return ReflectionTools.Enumerate(ReflectionTools.Get(reward, "Cards"))
+                .Where(card => card is not null).Select(card => PublicCardFace(card!)).ToArray();
+        if (SpecialRewardCard(reward) is { } specialCard)
+            return [PublicCardFace(specialCard)];
+        if (ReflectionTools.Get(reward, "Relic") is { } relic)
+            return [new { model_id = Entry(relic) }];
+        if (ReflectionTools.Get(reward, "Potion") is { } potion)
+            return [new { model_id = Entry(potion) }];
+        return [];
+    }
+
+    private object RunInventorySnapshot(object deck)
+    {
+        object creature = ReflectionTools.Get(_player!, "Creature")!;
+        return new
+        {
+            seed = _reset!.Seed,
+            ascension = _reset.Ascension,
+            character = Entry(ReflectionTools.Get(_player!, "Character")!),
+            act_index = ReflectionTools.Get(_run!, "CurrentActIndex"),
+            act_floor = ReflectionTools.Get(_run!, "ActFloor"),
+            total_floor = ReflectionTools.Get(_run!, "TotalFloor"),
+            current_hp = ReflectionTools.Get(creature, "CurrentHp"),
+            max_hp = ReflectionTools.Get(creature, "MaxHp"),
+            gold = ReflectionTools.Get(_player!, "Gold"),
+            rng_counters = RunRngCounters(),
+            deck = ReflectionTools.Enumerate(ReflectionTools.Get(deck, "Cards"))
+                .Where(card => card is not null).Select(card => PublicCardFace(card!)).ToArray(),
+            relics = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "Relics"))
+                .Where(relic => relic is not null).Select(relic => PublicRelicFace(relic!)).ToArray(),
+            potions = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "PotionSlots"))
+                .Select(potion => potion is null ? null : Entry(potion)).ToArray()
+        };
+    }
 
     private object ScoringFeatures()
     {
@@ -2784,20 +3029,38 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     private object? CustomRewardsSnapshot()
     {
         if (_pendingRewardsSet is null) return null;
-        object SnapshotReward(object reward) => new { kind = RewardKind(reward), model_id = RewardModelId(reward), implementation = reward.GetType().Name, selected = ReflectionTools.Get(reward, "SuccessfullySelected") };
-        object[] rewards = ReflectionTools.Enumerate(ReflectionTools.Get(_pendingRewardsSet, "Rewards")).Where(reward => reward is not null).Select((reward, index) =>
+        object SnapshotReward(object reward) => new
         {
-            object model = reward!;
-            object[] children = model.GetType().Name == "LinkedRewardSet" ? ReflectionTools.Enumerate(ReflectionTools.Get(model, "Rewards")).Where(child => child is not null).Select(child => SnapshotReward(child!)).ToArray() : [];
-            return (object)new { reward_index = index, reward = SnapshotReward(model), children };
-        }).ToArray();
+            kind = RewardKind(reward),
+            model_id = RewardModelId(reward),
+            amount = RewardAmount(reward),
+            options = RewardOptionsSnapshot(reward),
+            implementation = reward.GetType().Name,
+            selected = ReflectionTools.Get(reward, "SuccessfullySelected")
+        };
+        object[] rewards = ReflectionTools.Enumerate(ReflectionTools.Get(_pendingRewardsSet, "Rewards"))
+            .Where(reward => reward is not null).Select((reward, index) =>
+            {
+                object model = reward!;
+                object[] children = model.GetType().Name == "LinkedRewardSet"
+                    ? ReflectionTools.Enumerate(ReflectionTools.Get(model, "Rewards"))
+                        .Where(child => child is not null).Select(child => SnapshotReward(child!)).ToArray()
+                    : [];
+                return (object)new { reward_index = index, reward = SnapshotReward(model), children };
+            }).ToArray();
         return new { rewards, can_skip = !(bool)ReflectionTools.Get(_pendingRewardsSet, "DisallowSkipping")! };
     }
 
     private static string RewardKind(object reward) => reward.GetType().Name.Replace("Reward", "", StringComparison.Ordinal).ToLowerInvariant();
     private static string? RewardModelId(object reward)
     {
-        object? model = ReflectionTools.Get(reward, "Relic") ?? ReflectionTools.Get(reward, "Potion") ?? ReflectionTools.Get(reward, "Card") ?? ReflectionTools.Get(reward, "_card");
+        object? model = reward.GetType().Name switch
+        {
+            "RelicReward" => ReflectionTools.Get(reward, "Relic"),
+            "PotionReward" => ReflectionTools.Get(reward, "Potion"),
+            "SpecialCardReward" => ReflectionTools.Get(reward, "_card"),
+            _ => ReflectionTools.Get(reward, "Card")
+        };
         return model is null ? null : Entry(model);
     }
 
@@ -2805,26 +3068,34 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     {
         EnsureReset();
         if (_roomRewardsSet is null) throw new ProtocolException("invalid_state", "Reward stage has no native RewardsSet.");
-        object[] rewards = ReflectionTools.Enumerate(ReflectionTools.Get(_roomRewardsSet, "Rewards")).Where(reward => reward is not null).Select((reward, index) =>
-        {
-            object model = reward!;
-            object[] options = model.GetType().Name == "CardReward"
-                ? ReflectionTools.Enumerate(ReflectionTools.Get(model, "Cards")).Where(card => card is not null).Select(card => (object)new { model_id = Entry(card!) }).ToArray()
-                : ReflectionTools.Get(model, "Relic") is { } relic ? [new { model_id = Entry(relic) }]
-                : ReflectionTools.Get(model, "Potion") is { } potion ? [new { model_id = Entry(potion) }]
-                : [];
-            return (object)new { reward_index = index, kind = model.GetType().Name.Replace("Reward", "", StringComparison.Ordinal).ToLowerInvariant(), options, resolved = _resolvedRoomRewards.Contains(index) || (bool)ReflectionTools.Get(model, "SuccessfullySelected")! };
-        }).ToArray();
-        object deck = ReflectionTools.Get(_player!, "Deck")!; LegalAction[] actions = BuildRoomRewardActions().ToArray();
+        object[] rewards = ReflectionTools.Enumerate(ReflectionTools.Get(_roomRewardsSet, "Rewards"))
+            .Where(reward => reward is not null).Select((reward, index) =>
+            {
+                object model = reward!;
+                return (object)new
+                {
+                    reward_index = index,
+                    kind = model.GetType().Name.Replace("Reward", "", StringComparison.Ordinal).ToLowerInvariant(),
+                    amount = RewardAmount(model),
+                    model_id = RewardModelId(model),
+                    options = RewardOptionsSnapshot(model),
+                    resolved = _resolvedRoomRewards.Contains(index) || (bool)ReflectionTools.Get(model, "SuccessfullySelected")!
+                };
+            }).ToArray();
+        object deck = ReflectionTools.Get(_player!, "Deck")!;
+        LegalAction[] actions = BuildRoomRewardActions().ToArray();
         object observation = new
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = new { seed = _reset!.Seed, ascension = _reset.Ascension, gold = ReflectionTools.Get(_player!, "Gold"), rng_counters = RunRngCounters(), deck = ReflectionTools.Enumerate(ReflectionTools.Get(deck, "Cards")).Where(card => card is not null).Select(card => Entry(card!)).ToArray(), relics = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "Relics")).Where(relic => relic is not null).Select(relic => Entry(relic!)).ToArray(), potions = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "PotionSlots")).Select(potion => potion is null ? null : Entry(potion)).ToArray() },
+            run = RunInventorySnapshot(deck),
             room_rewards = new { rewards },
-            decision = new { kind = "room_reward_choice", legal_actions = actions }, terminal = false, victory = false
+            decision = new { kind = "room_reward_choice", legal_actions = actions },
+            terminal = false,
+            victory = false
         };
-        _hash = ComputeStateHash(observation); string handle = GetOrAddCurrentBranch();
+        _hash = ComputeStateHash(observation);
+        string handle = GetOrAddCurrentBranch();
         return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
