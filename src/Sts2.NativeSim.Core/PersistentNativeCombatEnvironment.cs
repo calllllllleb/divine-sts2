@@ -1929,7 +1929,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck),
+            run = CurrentPublicRunSnapshot(deck),
             map = new { points, visited = visitedCoords, current = currentPoint is null ? null : Coord(currentPoint) },
             decision = new { kind = actions.Length == 0 ? "map_terminal" : "map_choice", legal_actions = actions },
             terminal = actions.Length == 0,
@@ -1949,7 +1949,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck),
+            run = CurrentPublicRunSnapshot(deck),
             decision = new { kind = "act_transition", legal_actions = actions },
             terminal = false,
             victory = false
@@ -1967,7 +1967,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck),
+            run = CurrentPublicRunSnapshot(deck),
             decision = new { kind = "run_terminal", legal_actions = Array.Empty<LegalAction>() },
             terminal = true,
             victory = _runWon
@@ -2080,7 +2080,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck),
+            run = CurrentPublicRunSnapshot(deck),
             reward = new { kind = _rewardKind, options, can_skip = true, selected = _rewardCompleted },
             outstanding_choice = _pendingChoice?.Snapshot(),
             decision = new
@@ -2144,7 +2144,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck),
+            run = CurrentPublicRunSnapshot(deck),
             rest_site = new { options, selected = _restSelectionStarted && _pendingChoice is null },
             outstanding_choice = choice,
             outstanding_rewards = CustomRewardsSnapshot(),
@@ -2283,7 +2283,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck),
+            run = CurrentPublicRunSnapshot(deck),
             @event = new { model_id = _eventId, options, finished },
             outstanding_choice = _pendingChoice?.Snapshot(),
             outstanding_rewards = CustomRewardsSnapshot(),
@@ -2650,7 +2650,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck),
+            run = CurrentPublicRunSnapshot(deck),
             treasure = new { opened = _treasureOpened, resolved = _treasureResolved, relic_options = relicOptions },
             decision = new { kind = !_treasureOpened ? "treasure_open" : _treasureResolved ? "treasure_complete" : "treasure_relic_choice", legal_actions = actions },
             terminal = false, victory = false
@@ -2722,7 +2722,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck),
+            run = CurrentPublicRunSnapshot(deck),
             shop = new { entries },
             outstanding_choice = _pendingChoice?.Snapshot(),
             outstanding_rewards = CustomRewardsSnapshot(),
@@ -2806,7 +2806,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         return [];
     }
 
-    private object RunInventorySnapshot(object deck)
+    private object CurrentPublicRunSnapshot(object deck)
     {
         object creature = ReflectionTools.Get(_player!, "Creature")!;
         return new
@@ -2847,6 +2847,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             current_hp = ReflectionTools.Get(creature, "CurrentHp"), max_hp = ReflectionTools.Get(creature, "MaxHp"), block = ReflectionTools.Get(creature, "Block"),
             gold = ReflectionTools.Get(_player!, "Gold"),
             act_index = ReflectionTools.Get(_run!, "CurrentActIndex"), act_floor = ReflectionTools.Get(_run!, "ActFloor"),
+            total_floor = ReflectionTools.Get(_run!, "TotalFloor"),
             map_col = currentCoord is null ? null : ReflectionTools.Get(currentCoord, "col"), map_row = currentCoord is null ? null : ReflectionTools.Get(currentCoord, "row"),
             deck = ReflectionTools.Enumerate(ReflectionTools.Get(deck, "Cards")).Where(card => card is not null).Select(card => new
             {
@@ -2941,7 +2942,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck), custom_rewards = CustomRewardsSnapshot(), outstanding_choice = _pendingChoice?.Snapshot(),
+            run = CurrentPublicRunSnapshot(deck), custom_rewards = CustomRewardsSnapshot(), outstanding_choice = _pendingChoice?.Snapshot(),
             decision = new { kind = _pendingChoice is not null ? _pendingChoice.DecisionKind : _pendingRewardsSet is not null ? "custom_reward_choice" : "custom_reward_complete", legal_actions = actions },
             terminal = false, victory = false
         };
@@ -3088,7 +3089,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-            run = RunInventorySnapshot(deck),
+            run = CurrentPublicRunSnapshot(deck),
             room_rewards = new { rewards },
             decision = new { kind = "room_reward_choice", legal_actions = actions },
             terminal = false,
