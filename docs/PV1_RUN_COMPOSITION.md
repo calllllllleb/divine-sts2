@@ -47,8 +47,10 @@ identities. A receipt lists the six closed domains and composer version
 well, including special endpoints. There is no factual-seed replay fallback.
 
 Nested combat export carries the current native combat substrate only to an
-isolated authority. Its reset includes a whitelist of public Act/floor and room
-history; full native history analytics and Run future queues are excluded.
+isolated authority. Its reset includes a whitelist of public Act/floor, room
+history, odds scalars, and shop-removal count; full native history analytics and
+Run future queues are excluded. Warm combat snapshots restore the same public
+odds/counts, preventing earlier simulations from changing later simulations.
 Existing combat composition must independently resample draw order, monster
 belief, and future RNG before each inner simulation. Enchanted known-draw
 constraints distinguish otherwise identical public faces.

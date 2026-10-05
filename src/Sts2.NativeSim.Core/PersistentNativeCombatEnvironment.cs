@@ -4302,7 +4302,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 relics,
                 potions,
                 orbQueueSnapshot,
-                (string)ReflectionTools.Get(ReflectionTools.Get(_run!, "Rng")!, "StringSeed")!
+                (string)ReflectionTools.Get(ReflectionTools.Get(_run!, "Rng")!, "StringSeed")!,
+                PublicRunOddsSnapshot()
             );
         }
         catch (ProtocolException) { throw; }
@@ -4346,6 +4347,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             ReflectionTools.Set(playerCreature, "MaxHp", snap.PlayerMaxHp);
             ReflectionTools.Set(playerCreature, "Block", snap.PlayerBlock);
             ReflectionTools.Set(_player, "Gold", snap.Gold);
+            if (snap.PublicRunOdds is JsonElement publicOdds) RestorePublicRunOdds(publicOdds);
 
             // 2. PlayerCombatState
             ReflectionTools.Set(_pcs, "Energy", snap.Energy);
@@ -4920,7 +4922,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         List<RelicSnapshot> Relics,
         List<string?> PotionSlots,
         OrbQueueSnapshot? Orbs,
-        string? RunRngStringSeed = null);
+        string? RunRngStringSeed = null,
+        JsonElement? PublicRunOdds = null);
 
     private sealed record Branch(
         string? ParentHandle,

@@ -8,12 +8,48 @@ namespace Sts2.NativeSim.Core;
 
 public sealed partial class PersistentNativeCombatEnvironment
 {
+    // XuShuxi: These are audited public scalars, never RNG state or future queues.
+    private JsonElement PublicRunOddsSnapshot()
+    {
+        object unknown = ReflectionTools.Get(ReflectionTools.Get(_run!, "Odds")!, "UnknownMapPoint")!;
+        object odds = ReflectionTools.Get(_player!, "PlayerOdds")!;
+        return JsonSerializer.SerializeToElement(new {
+            card_shop_removals_used = ReflectionTools.Get(ReflectionTools.Get(_player!, "ExtraFields")!, "CardShopRemovalsUsed"),
+            unknown_monster_odds = ReflectionTools.Get(unknown, "MonsterOdds"),
+            unknown_elite_odds = ReflectionTools.Get(unknown, "EliteOdds"),
+            unknown_treasure_odds = ReflectionTools.Get(unknown, "TreasureOdds"),
+            unknown_shop_odds = ReflectionTools.Get(unknown, "ShopOdds"),
+            card_rarity_odds = ReflectionTools.Get(ReflectionTools.Get(odds, "CardRarity")!, "CurrentValue"),
+            potion_reward_odds = ReflectionTools.Get(ReflectionTools.Get(odds, "PotionReward")!, "CurrentValue")
+        });
+    }
+
+    private void RestorePublicRunOdds(JsonElement facts)
+    {
+        if (!facts.EnumerateObject().Select(pair => pair.Name).Order().SequenceEqual(new[] {
+            "card_rarity_odds", "card_shop_removals_used", "potion_reward_odds", "unknown_elite_odds",
+            "unknown_monster_odds", "unknown_shop_odds", "unknown_treasure_odds" }))
+            throw new ProtocolException("unsupported_public_run_odds", "Unaudited public odds field.");
+        int removals = facts.GetProperty("card_shop_removals_used").GetInt32();
+        if (removals < 0 || facts.EnumerateObject().Where(pair => pair.Name != "card_shop_removals_used")
+            .Any(pair => !float.IsFinite(pair.Value.GetSingle())))
+            throw new ProtocolException("unsupported_public_run_odds", "Invalid public odds scalar.");
+        object unknown = ReflectionTools.Get(ReflectionTools.Get(_run!, "Odds")!, "UnknownMapPoint")!;
+        foreach (var (json, native) in new[] { ("unknown_monster_odds", "MonsterOdds"),
+            ("unknown_elite_odds", "EliteOdds"), ("unknown_treasure_odds", "TreasureOdds"), ("unknown_shop_odds", "ShopOdds") })
+            ReflectionTools.Set(unknown, native, facts.GetProperty(json).GetSingle());
+        object odds = ReflectionTools.Get(_player!, "PlayerOdds")!;
+        ReflectionTools.Invoke(ReflectionTools.Get(odds, "CardRarity")!, "OverrideCurrentValue", facts.GetProperty("card_rarity_odds").GetSingle());
+        ReflectionTools.Invoke(ReflectionTools.Get(odds, "PotionReward")!, "OverrideCurrentValue", facts.GetProperty("potion_reward_odds").GetSingle());
+        ReflectionTools.Set(ReflectionTools.Get(_player!, "ExtraFields")!, "CardShopRemovalsUsed", removals);
+    }
+
     // XuShuxi: Only audited public history crosses the detached combat reset.
     // No analytics, RNG, future room sets, or grab-bag queues are accepted here.
     private void ApplyPublicCombatRunContext(IReadOnlyDictionary<string, JsonElement>? context)
     {
         if (context is null) return;
-        if (!context.Keys.Order().SequenceEqual(new[] { "act_floor", "act_index", "room_history" }))
+        if (!context.Keys.Order().SequenceEqual(new[] { "act_floor", "act_index", "public_odds", "room_history" }))
             throw new ProtocolException("unsupported_combat_run_context", "Unaudited Run context field.");
         int currentAct = context["act_index"].GetInt32(), floor = context["act_floor"].GetInt32();
         if (currentAct < 0 || currentAct >= ReflectionTools.Enumerate(ReflectionTools.Get(_run!, "Acts")).Count || floor < 0)
@@ -49,6 +85,7 @@ public sealed partial class PersistentNativeCombatEnvironment
         }
         ReflectionTools.Set(_run!, "CurrentActIndex", currentAct);
         ReflectionTools.Set(_run!, "ActFloor", floor);
+        RestorePublicRunOdds(context["public_odds"]);
     }
 
     private IReadOnlyDictionary<string, JsonElement> PublicCombatRunContext()
@@ -63,6 +100,7 @@ public sealed partial class PersistentNativeCombatEnvironment
         return new Dictionary<string, JsonElement> {
             ["act_index"] = JsonSerializer.SerializeToElement(ReflectionTools.Get(_run!, "CurrentActIndex")),
             ["act_floor"] = JsonSerializer.SerializeToElement(ReflectionTools.Get(_run!, "ActFloor")),
+            ["public_odds"] = PublicRunOddsSnapshot(),
             ["room_history"] = JsonSerializer.SerializeToElement(history, PortableRootJson)
         };
     }
