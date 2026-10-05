@@ -12,7 +12,7 @@ namespace Sts2.NativeSim.Core;
 
 /// Persistent, non-certifying native combat worker. Reflection is only an ABI adapter;
 /// every gameplay transition is dispatched into the shipped game assembly.
-public sealed class PersistentNativeCombatEnvironment : IDisposable
+public sealed partial class PersistentNativeCombatEnvironment : IDisposable
 {
     private static PersistentNativeCombatEnvironment? _activeEnvironment;
     private static bool _eventPresentationScope;
@@ -97,7 +97,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         protocol_version = ProtocolConstants.Version, observation_schema_version = ProtocolConstants.ObservationSchemaVersion,
         server = "sts2-native-sim-godot", persistent = true, certifying = false,
         game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-        methods = new[] { "hello", "catalog", "reset", "run_reset", "map_reset", "reward_reset", "item_reward_reset", "custom_reward_reset", "rest_reset", "event_reset", "observe", "run_observe", "map_observe", "reward_observe", "custom_reward_observe", "rest_observe", "event_observe", "legal_actions", "step", "run_step", "map_step", "reward_step", "custom_reward_step", "rest_step", "event_step", "fork", "restore", "export_combat_root", "import_combat_root", "resample_draw_order", "fork_future_rng", "describe_monster_move_candidates", "describe_monster_move_rules", "describe_monster_roll_events", "describe_monster_transient_events", "describe_monster_immediate_rule", "describe_monster_roll_rules", "reconstruct_monster_moves", "describe_monster_rng_provenance", "diagnostics", "close" },
+        methods = new[] { "hello", "catalog", "reset", "run_reset", "map_reset", "reward_reset", "item_reward_reset", "custom_reward_reset", "rest_reset", "event_reset", "observe", "run_observe", "map_observe", "reward_observe", "custom_reward_observe", "rest_observe", "event_observe", "legal_actions", "step", "run_step", "map_step", "reward_step", "custom_reward_step", "rest_step", "event_step", "fork", "restore", "export_run_root", "compose_run_root", "export_run_combat_root", "export_combat_root", "import_combat_root", "resample_draw_order", "fork_future_rng", "describe_monster_move_candidates", "describe_monster_move_rules", "describe_monster_roll_events", "describe_monster_transient_events", "describe_monster_immediate_rule", "describe_monster_roll_rules", "reconstruct_monster_moves", "describe_monster_rng_provenance", "diagnostics", "close" },
         supported_subset = new { characters = "native CharacterModel entries", encounters = "native EncounterModel entries", cards = "base/upgraded cards plus asynchronous native card, bundle, and relic choices", actions = new[] { "play_card", "use_potion", "discard_potion", "end_turn", "choose_cards", "choose_option", "choose_map", "choose_reward", "choose_rest", "choose_event", "open_treasure", "choose_treasure", "buy_shop", "choose_custom_reward", "skip_custom_rewards", "advance_act" }, potions = true, map = "native deterministic routing graph with composed combat, rest, event, treasure, shop, and inter-act transitions", events = "native model initialization, option continuations, nested event-created combats, blocking custom/linked rewards, and the final victory event" }
     };
 
@@ -179,7 +179,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         _cardInstanceIds.Clear();
         _combatCreaturesById.Clear();
         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-        _runMode = false; _runStage = "map"; _runWon = false; _roomRewardsSet = null; _resolvedRoomRewards.Clear(); _pendingRoomRewardIndex = null; _pendingRewardsSet = null; _pendingRewardSelection = null; _customRewardMode = false; _customRewardsLinked = false; _customRewardKinds = []; _treasureRoom = null; _treasureSynchronizer = null; _treasureOpened = false; _treasureResolved = false; _merchantRoom = null; _merchantInventory = null; _merchantEntryIdentities.Clear(); _mapMode = false; _rewardMode = false; _rewardKind = "card"; _rewardModelId = null; _cardReward = null; _restMode = false; _eventMode = false; _eventId = null; _event = null; Validate(request); _reset = request; _history.Clear(); _currentBranchHandle = null; _lastActionId = null; Construct(request);
+        _publicRunPulls.Clear(); _pendingPublicPulls.Clear(); _runRoomCoords.Clear(); _runMode = false; _runStage = "map"; _runWon = false; _roomRewardsSet = null; _resolvedRoomRewards.Clear(); _pendingRoomRewardIndex = null; _pendingRewardsSet = null; _pendingRewardSelection = null; _customRewardMode = false; _customRewardsLinked = false; _customRewardKinds = []; _treasureRoom = null; _treasureSynchronizer = null; _treasureOpened = false; _treasureResolved = false; _merchantRoom = null; _merchantInventory = null; _merchantEntryIdentities.Clear(); _mapMode = false; _rewardMode = false; _rewardKind = "card"; _rewardModelId = null; _cardReward = null; _restMode = false; _eventMode = false; _eventId = null; _event = null; Validate(request); _reset = request; _history.Clear(); _currentBranchHandle = null; _lastActionId = null; Construct(request);
         try
         {
             object? runManager = ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance");
@@ -340,7 +340,8 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         var drawn = mechanics.Hand.Where(card => !known.Contains(card.InstanceId)).ToArray();
         if (anchor.Snapshot.DrawPile.Count - mechanics.DrawPile.Count != drawn.Length) return null;
         return drawn.Select((card, index) => (object)new { sequence = index, kind = "DRAW",
-            card = new { model_id = card.ModelId, upgrades = card.Upgrades, current_cost = card.EnergyCost, costs_x = card.CostsX },
+            card = new { model_id = card.ModelId, upgrades = card.Upgrades, current_cost = card.EnergyCost, costs_x = card.CostsX,
+                         enchantment = card.EnchantmentModelId is null ? null : new { model_id = card.EnchantmentModelId, amount = (int)card.EnchantmentAmount } },
             source_zone = "DrawPile", pile_count_before = anchor.Snapshot.DrawPile.Count - index }).ToArray();
     }
 
@@ -433,7 +434,8 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         foreach ((int position, var fact) in claims)
         {
             CardSnapshot[] matches = available.Where(card => card.ModelId == fact.ModelId
-                && card.Upgrades == fact.Upgrades && card.EnergyCost == fact.CurrentCost && card.CostsX == fact.CostsX).ToArray();
+                && card.Upgrades == fact.Upgrades && card.EnergyCost == fact.CurrentCost && card.CostsX == fact.CostsX
+                && card.EnchantmentModelId == fact.EnchantmentModelId && card.EnchantmentAmount == fact.EnchantmentAmount).ToArray();
             if (matches.Length == 0)
                 throw new ProtocolException("unsatisfiable_draw_constraints", "Resident DrawPile cannot satisfy the public card multiplicity.");
             CardSnapshot chosen = matches[random.Next(matches.Length)];
@@ -1183,6 +1185,9 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             _lastSnapshotDebug = "snapshot_was_null";
         }
 
+        // XuShuxi: Reconstruct public history from this prefix; a discarded
+        // descendant's revealed relic pulls/coordinates cannot survive restore.
+        _publicRunPulls.Clear(); _pendingPublicPulls.Clear(); _runRoomCoords.Clear();
         _reset = branch.Reset; _history.Clear(); _cardInstanceIds.Clear(); _combatCreaturesById.Clear(); _dynamicCardOrdinal = 0; _currentBranchHandle = null; _lastActionId = null; Construct(branch.Reset); _runMode = branch.RunMode; _runStage = "map"; _pendingRewardsSet = null; _pendingRewardSelection = null;
         _mapMode = !_runMode && branch.MapMode; _rewardMode = !_runMode && branch.RewardMode; _rewardKind = branch.RewardKind; _rewardModelId = branch.RewardModelId; _restMode = !_runMode && branch.RestMode; _eventMode = !_runMode && branch.EventMode; _eventId = branch.EventId;
         _customRewardMode = branch.CustomRewardMode; _customRewardsLinked = branch.CustomRewardsLinked; _customRewardKinds = branch.CustomRewardKinds;
@@ -1264,6 +1269,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         object mode = Enum.GetValues(T("MegaCrit.Sts2.Core.Runs.GameMode")).GetValue(0)!;
         _run = T("MegaCrit.Sts2.Core.Runs.RunState").GetMethods(BindingFlags.Public | BindingFlags.Static).Single(x => x.Name == "CreateForTest")
             .Invoke(null, [List(playerType, [_player]), acts, modifiers, mode, r.Ascension, r.Seed])!;
+        ApplyPublicCombatRunContext(r.RunContext);
         object runManager = ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance")!;
         if (_runServicesInitialized)
         {
@@ -1589,7 +1595,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             decision = new { kind = terminal ? "terminal" : _pendingChoice is null ? "combat_action" : _pendingChoice.DecisionKind, legal_actions = actions }, terminal, victory = terminal && playerAlive
         };
         _hash = ComputeStateHash(observation); string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, actions, terminal, terminal && playerAlive, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, actions, terminal, terminal && playerAlive, handle, transition, ScoringFeatures());
     }
 
     private IReadOnlyList<LegalAction> BuildActions()
@@ -1831,11 +1837,10 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         }
     }
 
-    private EnvironmentResult CaptureMap(object? transition)
+    private object PublicMapSnapshot()
     {
         EnsureReset();
         object map = ReflectionTools.Get(_run!, "Map")!;
-        object deck = ReflectionTools.Get(_player!, "Deck")!;
         object act = ReflectionTools.Get(_run!, "Act")!;
         object? startingPoint = ReflectionTools.Get(map, "StartingMapPoint");
         object? bossPoint = ReflectionTools.Get(map, "BossMapPoint");
@@ -1875,8 +1880,14 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 return null;
             object[] history = ReflectionTools.Enumerate(actHistories[currentActIndex])
                 .Where(entry => entry is not null).Select(entry => entry!).ToArray();
-            if (row >= history.Length) return null;
-            object[] rooms = ReflectionTools.Enumerate(ReflectionTools.Get(history[row], "Rooms"))
+            // XuShuxi: A map row is not a history index (the first test-run room
+            // is row 1 at index 0). Resolve from observed coordinates, with the
+            // current native boundary as the authoritative newest entry.
+            int index = SamePoint(point, ReflectionTools.Get(_run!, "CurrentMapPoint")) ? history.Length - 1 : -1;
+            foreach (var entry in _runRoomCoords)
+                if (entry.Key.Act == currentActIndex && entry.Value == (col, row)) index = entry.Key.Index;
+            if (index < 0 || index >= history.Length) return null;
+            object[] rooms = ReflectionTools.Enumerate(ReflectionTools.Get(history[index], "Rooms"))
                 .Where(room => room is not null).Select(room => room!).ToArray();
             return rooms.Length == 0 ? null : ReflectionTools.Get(rooms[0], "RoomType")?.ToString();
         }
@@ -1924,20 +1935,27 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 col = ReflectionTools.Get(coord!, "col"),
                 row = ReflectionTools.Get(coord!, "row")
             }).ToArray();
+        return new { points, visited = visitedCoords, current = currentPoint is null ? null : Coord(currentPoint) };
+    }
+
+    private EnvironmentResult CaptureMap(object? transition)
+    {
+        object deck = ReflectionTools.Get(_player!, "Deck")!;
+        object map = PublicMapSnapshot();
         LegalAction[] actions = BuildMapActions().ToArray();
         object observation = new
         {
             schema_version = ProtocolConstants.ObservationSchemaVersion,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
             run = CurrentPublicRunSnapshot(deck),
-            map = new { points, visited = visitedCoords, current = currentPoint is null ? null : Coord(currentPoint) },
+            map,
             decision = new { kind = actions.Length == 0 ? "map_terminal" : "map_choice", legal_actions = actions },
             terminal = actions.Length == 0,
             victory = false
         };
         _hash = ComputeStateHash(observation);
         string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, actions, actions.Length == 0, false, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, actions, actions.Length == 0, false, handle, transition, ScoringFeatures());
     }
 
     private EnvironmentResult CaptureActTransition(object? transition)
@@ -1956,7 +1974,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         };
         _hash = ComputeStateHash(observation);
         string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
     private EnvironmentResult CaptureRunTerminal(object? transition)
@@ -1974,7 +1992,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         };
         _hash = ComputeStateHash(observation);
         string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, [], true, _runWon, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, [], true, _runWon, handle, transition, ScoringFeatures());
     }
 
     private void InitializeReward()
@@ -2093,7 +2111,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         };
         _hash = ComputeStateHash(observation);
         string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
     private void InitializeRestSite()
@@ -2161,7 +2179,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         };
         _hash = ComputeStateHash(observation);
         string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
     private async Task InitializeEventAsync()
@@ -2300,7 +2318,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         };
         _hash = ComputeStateHash(observation);
         string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
     private void EnsureRewardsSetViewing(object synchronizer, object rewardsSet)
@@ -2656,7 +2674,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             terminal = false, victory = false
         };
         _hash = ComputeStateHash(observation); string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
     private object[] MerchantEntries()
@@ -2736,7 +2754,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         };
         _hash = ComputeStateHash(observation);
         string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
     private (string Kind, string? ModelId) MerchantEntryIdentity(object entry)
@@ -2849,10 +2867,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             act_index = ReflectionTools.Get(_run!, "CurrentActIndex"), act_floor = ReflectionTools.Get(_run!, "ActFloor"),
             total_floor = ReflectionTools.Get(_run!, "TotalFloor"),
             map_col = currentCoord is null ? null : ReflectionTools.Get(currentCoord, "col"), map_row = currentCoord is null ? null : ReflectionTools.Get(currentCoord, "row"),
-            deck = ReflectionTools.Enumerate(ReflectionTools.Get(deck, "Cards")).Where(card => card is not null).Select(card => new
-            {
-                model_id = Entry(card!), upgrades = ReflectionTools.Get(card!, "CurrentUpgradeLevel"), enchantment = ReflectionTools.Get(card!, "Enchantment") is { } enchantment ? Entry(enchantment) : null
-            }).ToArray(),
+            deck = ReflectionTools.Enumerate(ReflectionTools.Get(deck, "Cards")).Where(card => card is not null).Select(card => PublicCardFace(card!)).ToArray(),
             relics = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "Relics")).Where(relic => relic is not null).Select(relic => Entry(relic!)).ToArray(),
             potion_count = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "PotionSlots")).Count(potion => potion is not null),
             potion_capacity = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "PotionSlots")).Count,
@@ -2947,7 +2962,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             terminal = false, victory = false
         };
         _hash = ComputeStateHash(observation); string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
     private void AddCustomRewardActions(List<LegalAction> actions, int rewardIndex, int childIndex, object reward)
@@ -3097,7 +3112,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         };
         _hash = ComputeStateHash(observation);
         string handle = GetOrAddCurrentBranch();
-        return new(observation, _hash, actions, false, false, handle, transition, ScoringFeatures());
+        return new(AugmentPublicRun(observation), _hash, actions, false, false, handle, transition, ScoringFeatures());
     }
 
     private object Creature(object c)
@@ -3281,12 +3296,20 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         MethodInfo stun = T("MegaCrit.Sts2.Core.Entities.Creatures.Creature").GetMethod("StunInternal", BindingFlags.Public | BindingFlags.Instance)!;
         P(stun, nameof(CaptureStunBefore));
         Po(stun, nameof(CaptureStunAfter));
+        foreach (MethodInfo pull in T("MegaCrit.Sts2.Core.Runs.RelicGrabBag").GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                     .Where(method => method.Name is "PullFromFront" or "PullFromBack"))
+            Po(pull, nameof(CapturePublicRelicPull));
         Type monsterModel = T("MegaCrit.Sts2.Core.Models.MonsterModel");
         MethodInfo nextMoveGetter = monsterModel.GetProperty("NextMove", BindingFlags.Public | BindingFlags.Instance)!.GetMethod!;
         Po(nextMoveGetter, nameof(CaptureImmediateTriggerProbe));
         MethodInfo immediate = monsterModel.GetMethod("SetMoveImmediate", BindingFlags.Public | BindingFlags.Instance)!;
         Po(immediate, nameof(CaptureImmediateAfter));
         P(T("MegaCrit.Sts2.Core.Commands.CreatureCmd").GetMethod("TriggerAnim", BindingFlags.Public | BindingFlags.Static)!, nameof(SkipTask));
+        // XuShuxi: SoulNexus.AfterDeath unsubscribes its native death handler,
+        // then updates a Spine track. Only that absent presentation node is null.
+        Type combatPresentation = T("MegaCrit.Sts2.Core.Nodes.Rooms.NCombatRoom");
+        P(combatPresentation.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static)!.GetMethod!, nameof(ReturnSoulDeathPresentationRoom));
+        P(combatPresentation.GetMethod("GetCreatureNode", BindingFlags.Public | BindingFlags.Instance)!, nameof(SkipSoulDeathPresentationNode));
         foreach (MethodInfo m in T("MegaCrit.Sts2.Core.Commands.SfxCmd").GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly)) { if (m.ReturnType != typeof(void)) throw new InvalidOperationException($"State-bearing SfxCmd: {m}"); P(m, nameof(SkipVoid)); }
         foreach (MethodInfo m in T("MegaCrit.Sts2.Core.Commands.ThinkCmd").GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly)) P(m, nameof(SkipVoid));
         foreach (MethodInfo m in T("MegaCrit.Sts2.Core.Logging.Log").GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly).Where(x => x.Name == "Info")) P(m, nameof(SkipVoid));
@@ -3336,7 +3359,9 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         P(audioManager.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static)!.GetMethod!, nameof(ReturnGameOverPresentationObject));
         P(audioManager.GetMethod("PlayMusic", BindingFlags.Public | BindingFlags.Instance)!, nameof(SkipVoid));
         Type debugAudio = T("MegaCrit.Sts2.Core.Audio.Debug.NDebugAudioManager");
-        P(debugAudio.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static)!.GetMethod!, nameof(ReturnScopedPresentationObject));
+        // XuShuxi: DollRoom.BeforeEventStarted only starts ambience before native
+        // options are generated. Audio has no mechanics and is absent headlessly.
+        P(debugAudio.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static)!.GetMethod!, nameof(ReturnUninitializedPresentationObject));
         P(debugAudio.GetMethod("Play", BindingFlags.Public | BindingFlags.Instance)!, nameof(SkipInt));
         P(debugAudio.GetMethod("Stop", BindingFlags.Public | BindingFlags.Instance)!, nameof(SkipVoid));
         Type activeScreen = T("MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext");
@@ -3360,9 +3385,8 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         P(saveManager.GetMethod("UpdateProgressAfterCombatWon", BindingFlags.Public | BindingFlags.Instance)!, nameof(SkipVoid));
         P(saveManager.GetMethod("SaveProgressFile", BindingFlags.Public | BindingFlags.Instance)!, nameof(SkipVoid));
         P(T("MegaCrit.Sts2.Core.Models.Monsters.DecimillipedeSegment").GetMethod("AnimSegmentsAttack", BindingFlags.NonPublic | BindingFlags.Instance)!, nameof(SkipTask));
-        // SandpitPower.AfterApplied, AfterPowerAmountChanged, and UpdateCreaturePositions are
-        // gameplay state-bearing lifecycle hooks (they reposition creatures and trigger native
-        // power effects). They must not be suppressed in the persistent environment.
+        // XuShuxi: Sandpit native decrement/removal/death hooks remain intact.
+        // Its IsOn-guarded methods below manipulate NCreature Godot positions only.
         // Crusher.BeforeDeath and Rocket.BeforeDeath / AfterCurrentHpChanged are shipped
         // combat-outcome hooks; removing them would change the native death/reward path.
         // SoulNexus.AfterDeath is a state transition hook.
@@ -3426,7 +3450,7 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         object[] snapshots = bundles.Select((bundle, index) => (object)new
         {
             option_id = optionIds[index],
-            cards = ReflectionTools.Enumerate(bundle).Where(card => card is not null).Select(card => new { model_id = Entry(card!) }).ToArray()
+            cards = ReflectionTools.Enumerate(bundle).Where(card => card is not null).Select(card => environment.PublicCardFace(card!)).ToArray()
         }).ToArray();
         environment._pendingChoice = new(
             choiceId, "option_choice", "choose_option", optionIds, 1, 1, snapshots,
@@ -3510,6 +3534,20 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
         __result = RuntimeHelpers.GetUninitializedObject(((MethodInfo)__originalMethod).ReturnType);
         return false;
     }
+    private static bool IsSoulDeathPresentation() => new StackTrace().GetFrames().Select(frame => frame.GetMethod())
+        .Any(method => method?.DeclaringType?.FullName == "MegaCrit.Sts2.Core.Models.Monsters.SoulNexus" && method.Name == "AfterDeath");
+    private static bool ReturnSoulDeathPresentationRoom(MethodBase __originalMethod, ref object? __result)
+    {
+        if (!IsSoulDeathPresentation()) return true;
+        __result = RuntimeHelpers.GetUninitializedObject(((MethodInfo)__originalMethod).ReturnType);
+        return false;
+    }
+    private static bool SkipSoulDeathPresentationNode(ref object? __result)
+    {
+        if (!IsSoulDeathPresentation()) return true;
+        __result = null;
+        return false;
+    }
     private static bool SuppressScopedPresentationGuard(ref bool __result)
     {
         // CreatureCmd.Kill has already applied native death hooks and LoseCombat before this
@@ -3546,6 +3584,13 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
     }
     private static bool EnableTransformPresentationGuard(ref bool __result)
     {
+        // XuShuxi: Audited shipped guards affect visual state only. In particular
+        // Sandpit.AfterRemoved still decrements and kills through native commands.
+        bool sandpitVisual = new StackTrace().GetFrames().Select(frame => frame.GetMethod())
+            .Any(method => method?.DeclaringType?.FullName == "MegaCrit.Sts2.Core.Models.Powers.SandpitPower" && method.Name == "AfterApplied"
+                || method?.DeclaringType?.FullName?.StartsWith("MegaCrit.Sts2.Core.Models.Powers.SandpitPower+<AfterPowerAmountChanged>", StringComparison.Ordinal) == true
+                || method?.DeclaringType?.FullName?.StartsWith("MegaCrit.Sts2.Core.Models.Powers.SandpitPower+<UpdateCreaturePositions>", StringComparison.Ordinal) == true);
+        if (sandpitVisual) { __result = true; return false; }
         string[] testModeCallers =
         {
             "MegaCrit.Sts2.Core.Commands.CardCmd+<Transform>",
@@ -3620,7 +3665,9 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
             option_id = optionIds[index], model_id = Entry(card),
             upgrades = ReflectionTools.Get(card, "CurrentUpgradeLevel"),
             current_cost = ReflectionTools.Invoke(ReflectionTools.Get(card, "EnergyCost")!, "GetResolved"),
-            costs_x = ReflectionTools.Get(ReflectionTools.Get(card, "EnergyCost")!, "CostsX")
+            costs_x = ReflectionTools.Get(ReflectionTools.Get(card, "EnergyCost")!, "CostsX"),
+            enchantment = ReflectionTools.Get(card, "Enchantment") is { } enchantment
+                ? new { model_id = Entry(enchantment), amount = ReflectionTools.Get(enchantment, "Amount") } : null
         }).ToArray();
         string provenance = string.Join(" > ", new StackTrace().GetFrames()
             .Select(frame => frame.GetMethod())
@@ -3637,7 +3684,16 @@ public sealed class PersistentNativeCombatEnvironment : IDisposable
                 object typed = List(cardModel, selected);
                 completion.GetType().GetMethod("SetResult")!.Invoke(completion, [typed]);
             },
-            () => TryCancelCompletion(completion), provenance, ChoiceSemantics(provenance, max), provenance.Contains("<FromHand", StringComparison.Ordinal) || provenance.Contains("<FromChooseACardScreen", StringComparison.Ordinal));
+            // XuShuxi: These shipped deck screens pass the selector list to
+            // NCardGrid.SetCards with Ascending, which retains that exact order.
+            // Visible grid slots do not imply ordered completed selections.
+            () => TryCancelCompletion(completion), provenance, ChoiceSemantics(provenance, max),
+            provenance.Contains("<FromHand", StringComparison.Ordinal)
+            || provenance.Contains("<FromChooseACardScreen", StringComparison.Ordinal)
+            || provenance.Contains("<FromDeckGeneric", StringComparison.Ordinal)
+            || provenance.Contains("<FromDeckForEnchantment", StringComparison.Ordinal)
+            || provenance.Contains("<FromDeckForUpgrade", StringComparison.Ordinal)
+            || provenance.Contains("<FromDeckForTransformation", StringComparison.Ordinal));
         _choiceBegun?.TrySetResult();
         return ReflectionTools.Get(completion, "Task");
     }

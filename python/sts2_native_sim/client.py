@@ -369,6 +369,16 @@ class NativeWorker:
         self._remember_handle(result["state_handle"])
         return result
 
+    def export_run_root(self) -> dict[str, Any]:
+        """Search-private substrate; never an observation/record. Author: XuShuxi."""
+        return self.request("export_run_root", {})
+
+    def compose_run_root(self, root: dict, *, search_entropy: int) -> dict:
+        return self.request("compose_run_root", {"root": root, "search_entropy": search_entropy})
+
+    def export_run_combat_root(self) -> dict:
+        return self.request("export_run_combat_root", {})
+
     def export_combat_root(self) -> dict[str, Any]:
         """Export an exact ordinary-combat root, including factual hidden state."""
         return self.request("export_combat_root")

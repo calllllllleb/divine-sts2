@@ -50,6 +50,19 @@ public sealed record PortableCombatRoot(
     [property: JsonPropertyName("combat_snapshot")] JsonElement CombatSnapshot,
     [property: JsonPropertyName("expected_state_hash")] string ExpectedStateHash);
 public sealed record StepRequest([property: JsonPropertyName("action_id")] string ActionId);
+// Search-private Run composition payload. Author: XuShuxi.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record PortableRunRoot(
+    [property: JsonPropertyName("schema_version")] int SchemaVersion,
+    [property: JsonPropertyName("game_build")] GameBuildSpec GameBuild,
+    [property: JsonPropertyName("public_reset")] ResetRequest PublicReset,
+    [property: JsonPropertyName("public_map")] JsonElement PublicMap,
+    [property: JsonPropertyName("boss")] string Boss,
+    [property: JsonPropertyName("second_boss")] string? SecondBoss);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ComposeRunRootRequest(
+    [property: JsonPropertyName("root")] PortableRunRoot Root,
+    [property: JsonPropertyName("search_entropy")] long SearchEntropy);
 public sealed record EventResetRequest(
     [property: JsonPropertyName("state")] ResetRequest State,
     [property: JsonPropertyName("event_id")] string EventId);
@@ -67,7 +80,9 @@ public sealed record VisibleDrawCardConstraint(
     [property: JsonPropertyName("model_id"), JsonRequired] string ModelId,
     [property: JsonPropertyName("upgrades"), JsonRequired] int Upgrades,
     [property: JsonPropertyName("current_cost"), JsonRequired] int? CurrentCost,
-    [property: JsonPropertyName("costs_x"), JsonRequired] bool? CostsX);
+    [property: JsonPropertyName("costs_x"), JsonRequired] bool? CostsX,
+    [property: JsonPropertyName("enchantment_model_id")] string? EnchantmentModelId = null,
+    [property: JsonPropertyName("enchantment_amount")] int EnchantmentAmount = 0);
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record DrawOrderConstraints(
     [property: JsonPropertyName("known_draw_top"), JsonRequired] IReadOnlyList<VisibleDrawCardConstraint> KnownDrawTop,
