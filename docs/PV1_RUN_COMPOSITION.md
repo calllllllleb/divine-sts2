@@ -23,6 +23,14 @@ slots without changing the completion's set/sequence semantics. Public card face
 including bundle/deck choices, contain only model, upgrades, resolved cost, X cost,
 and enchantment identity/amount. Gold and special-card rewards retain N1 faces.
 
+Public combat movement evidence observes shipped pile commands without changing
+their mechanics. A top/bottom insertion is reported only when the native command
+advertises that position and the source card was in a visible Hand or DiscardPile.
+A draw reports its face only after the shipped first-card Draw enters Hand.
+Shuffles, random insertions, unknown-source insertions, and unaudited order changes
+invalidate known positions; they never publish realized hidden slots or faces.
+Async-local command scopes retain this distinction across native awaits.
+
 ## Search-private RPC
 
 `export_run_root`, `compose_run_root`, and `export_run_combat_root` are private

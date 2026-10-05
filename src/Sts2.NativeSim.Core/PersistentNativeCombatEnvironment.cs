@@ -240,7 +240,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     public EnvironmentResult Observe() { ThrowIfPoisoned(); return Capture(null); }
     public IReadOnlyList<LegalAction> LegalActions() { ThrowIfPoisoned(); return BuildActions(); }
 
-    public async Task<EnvironmentResult> StepAsync(string actionId, bool record = true)
+    private async Task<EnvironmentResult> StepInternalAsync(string actionId, bool record = true)
     {
         _monsterRollEvents.Clear();
         _monsterTransientEvents.Clear();
@@ -301,6 +301,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         try
         {
             EnvironmentResult result = Capture(new { kind = action.Kind, action_id = actionId, elapsed_ms = timer.Elapsed.TotalMilliseconds, history_length = _history.Count });
+            result = result with { PublicCardEvents = PublicMovementEvidence() };
             // XuShuxi: Only the bounded deterministic Prepared prefix certifies
             // public DRAW order. Unknown effects publish null and fail closed.
             PendingAnchor? evidenceAnchor = _pendingAnchor ?? resolvedAnchor;
@@ -3292,6 +3293,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         Assembly ha = _context.LoadDependency("0Harmony.dll"); Type ht = ha.GetType("HarmonyLib.Harmony", true)!, hmt = ha.GetType("HarmonyLib.HarmonyMethod", true)!; object harmony = Activator.CreateInstance(ht, "sts2.native-sim.persistent")!; MethodInfo patch = ht.GetMethods().Single(x => x.Name == "Patch" && x.GetParameters().Length == 5);
         void P(MethodInfo m, string n) => patch.Invoke(harmony, [m, Activator.CreateInstance(hmt, typeof(PersistentNativeCombatEnvironment).GetMethod(n, BindingFlags.NonPublic | BindingFlags.Static)!), null, null, null]);
         void Po(MethodInfo m, string n) => patch.Invoke(harmony, [m, null, Activator.CreateInstance(hmt, typeof(PersistentNativeCombatEnvironment).GetMethod(n, BindingFlags.NonPublic | BindingFlags.Static)!), null, null]);
+        InstallPublicMovementObservers(P, Po);
         P(T("MegaCrit.Sts2.Core.Models.MonsterModel").GetMethod("RollMove", BindingFlags.Public | BindingFlags.Instance)!, nameof(CaptureMonsterRollContext));
         MethodInfo stun = T("MegaCrit.Sts2.Core.Entities.Creatures.Creature").GetMethod("StunInternal", BindingFlags.Public | BindingFlags.Instance)!;
         P(stun, nameof(CaptureStunBefore));
