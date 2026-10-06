@@ -6,7 +6,7 @@ namespace Sts2.NativeSim.Core;
 
 public sealed partial class PersistentNativeCombatEnvironment
 {
-    // Entity-only contract. Native shared combat history is deliberately not represented here.
+    // Entity-only contract. Shared combat history has an independent codec and contract.
     private const int OstyEntityContractVersion = 1;
     private sealed record OstyEntityPayload(int Version, OstyEntitySnapshot? Entity);
     private sealed record OstyEntitySnapshot(

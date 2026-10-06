@@ -99,6 +99,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     {
         protocol_version = ProtocolConstants.Version, observation_schema_version = ProtocolConstants.ObservationSchemaVersion,
         server = "sts2-native-sim-godot", persistent = true, certifying = false,
+        combat_root_schema_version = ProtocolConstants.CombatRootSchemaVersion,
+        combat_history_contract_version = CombatHistoryContractVersion,
         game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
         methods = new[] { "hello", "catalog", "reset", "run_reset", "map_reset", "reward_reset", "item_reward_reset", "custom_reward_reset", "rest_reset", "event_reset", "observe", "run_observe", "map_observe", "reward_observe", "custom_reward_observe", "rest_observe", "event_observe", "legal_actions", "step", "run_step", "map_step", "reward_step", "custom_reward_step", "rest_step", "event_step", "fork", "restore", "export_run_root", "export_run_mechanical_root", "compose_run_root", "compose_run_root_reference", "export_run_combat_root", "export_combat_root", "import_combat_root", "resample_draw_order", "fork_future_rng", "describe_monster_move_candidates", "describe_monster_move_rules", "describe_monster_roll_events", "describe_monster_transient_events", "describe_monster_immediate_rule", "describe_monster_roll_rules", "reconstruct_monster_moves", "describe_monster_rng_provenance", "diagnostics", "close" },
         supported_subset = new { characters = "native CharacterModel entries", encounters = "native EncounterModel entries", cards = "base/upgraded cards plus asynchronous native card, bundle, and relic choices", actions = new[] { "play_card", "use_potion", "discard_potion", "end_turn", "choose_cards", "choose_option", "choose_map", "choose_reward", "choose_rest", "choose_event", "open_treasure", "choose_treasure", "buy_shop", "choose_custom_reward", "skip_custom_rewards", "advance_act" }, potions = true, map = "native deterministic routing graph with composed combat, rest, event, treasure, shop, and inter-act transitions", events = "native model initialization, option continuations, nested event-created combats, blocking custom/linked rewards, and the final victory event" }
@@ -382,9 +384,15 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             throw new ProtocolException("build_mismatch", "Portable roots require the exact game build identity.");
         if (root.BaseReset is null || string.IsNullOrWhiteSpace(root.ExpectedStateHash))
             throw new ProtocolException("invalid_combat_root", "A base reset and expected state hash are required.");
-        CombatSnapshot snapshot = root.CombatSnapshot.Deserialize<CombatSnapshot>(PortableRootJson)
-            ?? throw new ProtocolException("invalid_combat_root", "Missing combat snapshot.");
+        CombatSnapshot snapshot;
+        try
+        {
+            snapshot = root.CombatSnapshot.Deserialize<CombatSnapshot>(PortableRootJson)
+                ?? throw new ProtocolException("invalid_combat_root", "Missing combat snapshot.");
+        }
+        catch (JsonException ex) { throw new ProtocolException("invalid_combat_history", "Invalid combat snapshot/history JSON: " + ex.Message); }
         ValidateOstyEntityDescriptor(snapshot);
+        ValidateCombatHistory(snapshot);
         foreach (EnemySnapshot enemy in snapshot.Enemies)
             if (enemy.MonsterRuntimeState is null)
                 throw new ProtocolException("unsupported_combat_root", "Missing exact monster runtime payload.");
@@ -409,6 +417,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             throw new ProtocolException("combat_root_monster_mismatch", "Imported monster runtime fingerprint differs.");
         if (!OstyEntityFingerprintMatches(snapshot, actual))
             throw new ProtocolException("combat_root_osty_entity_mismatch", "Imported Osty entity fingerprint differs.");
+        if (!CombatHistoryFingerprintMatches(snapshot, actual))
+            throw new ProtocolException("combat_root_history_mismatch", "Imported shared history fingerprint differs.");
         timer.Stop();
         return imported with { Transition = new { kind = "portable_combat_root_import", replayed_actions = 0, elapsed_ms = timer.Elapsed.TotalMilliseconds } };
     }
@@ -4356,7 +4366,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 orbQueueSnapshot = new OrbQueueSnapshot(cap, orbs);
             }
 
-            return new CombatSnapshot(
+            CombatSnapshot captured = new(
                 playerHp,
                 playerMaxHp,
                 playerBlock,
@@ -4383,8 +4393,11 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 orbQueueSnapshot,
                 (string)ReflectionTools.Get(ReflectionTools.Get(_run!, "Rng")!, "StringSeed")!,
                 PublicRunOddsSnapshot(),
-                CaptureOstyEntity(CapturePowers)
+                CaptureOstyEntity(CapturePowers),
+                CaptureCombatHistory()
             );
+            ValidateCombatHistory(captured);
+            return captured;
         }
         catch (ProtocolException) { throw; }
         catch (Exception ex)
@@ -4402,6 +4415,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         try
         {
             object? residentOsty = ValidateOstyEntityBinding(snap);
+            ValidateCombatHistory(snap);
             // XuShuxi: Reject ambiguous bindings before mutating any native state.
             CardSnapshot[] residentCards = snap.Hand.Concat(snap.DrawPile).Concat(snap.DiscardPile)
                 .Concat(snap.ExhaustPile).Concat(snap.PlayPile).ToArray();
@@ -4481,10 +4495,12 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                     }
                     // XuShuxi: Restore combat-only afflictions as exact card-owned state,
                     // including clearing mutations left by another resident branch.
+                    object? residentAffliction = ReflectionTools.Get(nativeCard, "Affliction");
                     ReflectionTools.Invoke(nativeCard, "ClearAfflictionInternal");
                     if (cs.AfflictionModelId is not null)
                     {
-                        object affliction = Mutable("DebugAfflictions", cs.AfflictionModelId);
+                        object affliction = residentAffliction is not null && Entry(residentAffliction) == cs.AfflictionModelId
+                            ? residentAffliction : Mutable("DebugAfflictions", cs.AfflictionModelId);
                         ApplyNativeProperties(affliction, cs.AfflictionSavedProperties);
                         ReflectionTools.Invoke(nativeCard, "AfflictInternal", affliction, (decimal)cs.AfflictionAmount);
                     }
@@ -4560,13 +4576,18 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             // 7. Orbs
             if (snap.Orbs is not null && ReflectionTools.Get(_pcs, "OrbQueue") is { } queue)
             {
+                object[] residentOrbs = ReflectionTools.Enumerate(ReflectionTools.Get(queue, "Orbs")).Cast<object>().ToArray();
                 ReflectionTools.Invoke(queue, "Clear");
                 ReflectionTools.Invoke(queue, "AddCapacity", snap.Orbs.Capacity);
                 IList orbsList = (IList)ReflectionTools.Get(queue, "_orbs")!;
                 orbsList.Clear();
-                foreach (OrbSnapshot os in snap.Orbs.Orbs)
+                for (int orbIndex = 0; orbIndex < snap.Orbs.Orbs.Count; orbIndex++)
                 {
-                    object orb = Mutable("AllOrbs", os.ModelId);
+                    OrbSnapshot os = snap.Orbs.Orbs[orbIndex];
+                    object orb = orbIndex < residentOrbs.Length && Entry(residentOrbs[orbIndex]) == os.ModelId
+                        ? residentOrbs[orbIndex] : Mutable("AllOrbs", os.ModelId);
+                    ReflectionTools.Set(orb, "_owner", _player);
+                    ReflectionTools.Set(orb, "HasBeenRemovedFromState", false);
                     ReflectionTools.Set(orb, "PassiveVal", os.PassiveVal);
                     ReflectionTools.Set(orb, "EvokeVal", os.EvokeVal);
                     ApplyNativeProperties(orb, os.SavedProperties);
@@ -4705,6 +4726,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             ReflectionTools.Set(_combat, "_nextCreatureId", snap.NextCreatureId);
             ReflectionTools.Set(_manager!, "_state", _combat);
             ReflectionTools.Set(_manager!, "IsInProgress", true);
+            RestoreCombatHistory(snap.CombatHistory!);
 
             return true;
         }
@@ -4719,10 +4741,11 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     private void RestoreCreaturePowers(object creature, List<PowerSnapshot> powerSnaps)
     {
         IList powersList = (IList)ReflectionTools.Get(creature, "_powers")!;
+        object[] resident = powersList.Cast<object>().ToArray();
         powersList.Clear();
         foreach (PowerSnapshot ps in powerSnaps)
         {
-            object power = Mutable("AllPowers", ps.ModelId);
+            object power = resident.FirstOrDefault(p => Entry(p) == ps.ModelId) ?? Mutable("AllPowers", ps.ModelId);
             ReflectionTools.Set(power, "_amount", ps.Amount);
             ReflectionTools.Set(power, "_owner", creature);
             ApplyNativeProperties(power, ps.SavedProperties);
@@ -4883,7 +4906,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         CombatSnapshot? actual = CaptureCombatSnapshot();
         return actual is not null && JsonSerializer.Serialize(expected.Enemies, PortableRootJson)
             == JsonSerializer.Serialize(actual.Enemies, PortableRootJson)
-            && OstyEntityFingerprintMatches(expected, actual);
+            && OstyEntityFingerprintMatches(expected, actual)
+            && CombatHistoryFingerprintMatches(expected, actual);
     }
 
     private List<MonsterRuntimeEntry> CaptureMonsterRuntimeState(object monster)
@@ -5003,7 +5027,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         OrbQueueSnapshot? Orbs,
         string? RunRngStringSeed = null,
         JsonElement? PublicRunOdds = null,
-        OstyEntityPayload? OstyEntity = null);
+        OstyEntityPayload? OstyEntity = null,
+        CombatHistorySnapshot? CombatHistory = null);
 
     private sealed record Branch(
         string? ParentHandle,
