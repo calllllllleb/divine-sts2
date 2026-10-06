@@ -101,6 +101,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         server = "sts2-native-sim-godot", persistent = true, certifying = false,
         combat_root_schema_version = ProtocolConstants.CombatRootSchemaVersion,
         combat_history_contract_version = CombatHistoryContractVersion,
+        combat_history_consumer_contract = HistoryConsumerContract,
         game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
         methods = new[] { "hello", "catalog", "reset", "run_reset", "map_reset", "reward_reset", "item_reward_reset", "custom_reward_reset", "rest_reset", "event_reset", "observe", "run_observe", "map_observe", "reward_observe", "custom_reward_observe", "rest_observe", "event_observe", "legal_actions", "step", "run_step", "map_step", "reward_step", "custom_reward_step", "rest_step", "event_step", "fork", "restore", "export_run_root", "export_run_mechanical_root", "compose_run_root", "compose_run_root_reference", "export_run_combat_root", "export_combat_root", "import_combat_root", "resample_draw_order", "fork_future_rng", "describe_monster_move_candidates", "describe_monster_move_rules", "describe_monster_roll_events", "describe_monster_transient_events", "describe_monster_immediate_rule", "describe_monster_roll_rules", "reconstruct_monster_moves", "describe_monster_rng_provenance", "diagnostics", "close" },
         supported_subset = new { characters = "native CharacterModel entries", encounters = "native EncounterModel entries", cards = "base/upgraded cards plus asynchronous native card, bundle, and relic choices", actions = new[] { "play_card", "use_potion", "discard_potion", "end_turn", "choose_cards", "choose_option", "choose_map", "choose_reward", "choose_rest", "choose_event", "open_treasure", "choose_treasure", "buy_shop", "choose_custom_reward", "skip_custom_rewards", "advance_act" }, potions = true, map = "native deterministic routing graph with composed combat, rest, event, treasure, shop, and inter-act transitions", events = "native model initialization, option continuations, nested event-created combats, blocking custom/linked rewards, and the final victory event" }
@@ -4605,7 +4606,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 {
                     OrbSnapshot os = snap.Orbs.Orbs[orbIndex];
                     object orb = orbIndex < residentOrbs.Length && Entry(residentOrbs[orbIndex]) == os.ModelId
-                        ? residentOrbs[orbIndex] : Mutable("AllOrbs", os.ModelId);
+                        ? residentOrbs[orbIndex] : Mutable("Orbs", os.ModelId);
                     ReflectionTools.Set(orb, "_owner", _player);
                     ReflectionTools.Set(orb, "HasBeenRemovedFromState", false);
                     ReflectionTools.Set(orb, "PassiveVal", os.PassiveVal);
@@ -4776,7 +4777,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             ValidateBoundPowerSnapshot(ps);
             if (ps.Runtime is { } runtime)
             {
-                ValidateHistoricalModelAbi(power, "Power", "Resident.Power");
+                ValidateResidentPowerAbi(power, "Power", "Resident.Power");
                 ReflectionTools.Set(power, "_amountOnTurnStart", runtime.AmountOnTurnStart);
                 ReflectionTools.Set(power, "_skipNextDurationTick", runtime.SkipNextDurationTick);
                 ReflectionTools.Set(power, "_resolvedBigIconPath", runtime.ResolvedBigIconPath);
@@ -4816,7 +4817,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
 
     private ResidentPowerRuntime CaptureResidentPowerRuntime(object power)
     {
-        ValidateHistoricalModelAbi(power, "Power", "Resident.Power");
+        ValidateResidentPowerAbi(power, "Power", "Resident.Power");
         if (ReflectionTools.Get(power, "_internalData") is not null)
             throw new ProtocolException("unsupported_power_runtime", "Reviewed resident Power has unknown private data.");
         uint? Id(object? creature)
