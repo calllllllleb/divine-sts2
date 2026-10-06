@@ -381,14 +381,24 @@ class NativeWorker:
         """Search-private substrate; never an observation/record. Author: XuShuxi."""
         return self.request("export_run_root", {})
 
-    def compose_run_root(self, root: dict, *, search_entropy: int) -> dict:
-        """Install a v4 current public root and bounded joint posterior. Author: XuShuxi."""
-        result = self.request("compose_run_root", {"root": root, "search_entropy": search_entropy}, timeout=self.run_composition_timeout)
+    def export_run_mechanical_root(self) -> dict:
+        """Private current mechanical anchor; never model data. Author: XuShuxi."""
+        return self.request("export_run_mechanical_root", {})
+
+    def compose_run_root(self, root: dict, *, search_entropy: int, mechanical_root: dict | None = None) -> dict:
+        """Current-root v5 kernel; missing mechanical anchors fail closed. Author: XuShuxi."""
+        result = self.request("compose_run_root", {"root": root, "search_entropy": search_entropy,
+                                                   "mechanical_root": mechanical_root}, timeout=self.run_composition_timeout)
         self._handle_histories.clear()
         self._history = []
         self._reset_state = self._reset_request = None
         self._remember_handle(result["state"]["state_handle"])
         return result
+
+    def compose_run_root_reference(self, root: dict, *, search_entropy: int) -> dict:
+        """Explicit whole-prior regression oracle, never production acquire. Author: XuShuxi."""
+        return self.request("compose_run_root_reference", {"root": root, "search_entropy": search_entropy},
+                            timeout=self.run_composition_timeout)
 
     def export_run_combat_root(self) -> dict:
         return self.request("export_run_combat_root", {})

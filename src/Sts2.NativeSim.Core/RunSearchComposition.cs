@@ -313,7 +313,17 @@ public sealed partial class PersistentNativeCombatEnvironment
             // failures keep their real diagnostic rather than masquerading as JSON.
             throw new ProtocolException("invalid_public_run_root", error.Message);
         }
-        return ComposeValidatedRunWorld(root, request.SearchEntropy);
+        ValidateMechanicalRoot(root, request.MechanicalRoot);
+        return ComposeCurrentRunKernel(root, request.MechanicalRoot!, request.SearchEntropy);
+    }
+
+    // XuShuxi: Explicit regression oracle. Production acquire never calls this.
+    public object ComposeRunRootReference(ComposeRunRootRequest request)
+    {
+        ValidateRequiredPublicContract(request, new NullabilityInfoContext());
+        ValidateRunCompositionInputs(request);
+        var wall = System.Diagnostics.Stopwatch.StartNew();
+        return ComposeValidatedRunWorld(request.Root, request.SearchEntropy, wall);
     }
 
     private void ValidateRunCompositionInputs(ComposeRunRootRequest request)
@@ -342,7 +352,7 @@ public sealed partial class PersistentNativeCombatEnvironment
             throw new ProtocolException("run_rest_continuation_evidence_missing", "Only SmithRestSiteOption's pre-selection continuation is certified: it has no mutation before FromDeckForUpgrade.");
     }
 
-    private object ComposeValidatedRunWorld(PortableRunRoot root, long searchEntropy)
+    private object ComposeValidatedRunWorld(PortableRunRoot root, long searchEntropy, System.Diagnostics.Stopwatch wall)
     {
         // XuShuxi: Rejection samples the complete native prior jointly, then
         // consumes only certified public encounter evidence. No resident suffix
@@ -373,6 +383,14 @@ public sealed partial class PersistentNativeCombatEnvironment
                 $"domain=encounter_event_relic_joint; attempts={maxAttempts}; first_contradicted_public_evidence={firstContradiction}",
                 new { domain = "encounter_event_relic_joint", attempts = maxAttempts, first_contradicted_public_evidence = firstContradiction,
                     rejected_public_evidence_counts = rejectedEvidence });
+        double kernelMs = wall.Elapsed.TotalMilliseconds;
+        ReplaceRunFutureRng(searchEntropy);
+        return FinishComposedRunWorld(root, attempts, "whole_prior_reference", wall, 0, kernelMs, rejectedEvidence);
+    }
+
+    private object FinishComposedRunWorld(PortableRunRoot root, int attempts, string algorithm,
+        System.Diagnostics.Stopwatch wall, double importMs, double kernelMs, IReadOnlyDictionary<string, int> rejectedEvidence)
+    {
         InstallPublicRunPlayer(root.CurrentPlayer);
         _runEventSelections.AddRange(root.EventSelections);
         _runRelicOperations.AddRange(root.RelicOperations);
@@ -392,10 +410,15 @@ public sealed partial class PersistentNativeCombatEnvironment
         RegenerateRunBoundary(root);
         _composedRunWorld = true;
         return new { state = Capture(new { kind = "run_belief_composition" }),
-                     composition = new { version = "pv1-run-composition-v4", attempts,
+                     composition = new { version = "pv1-run-composition-v5", algorithm, attempts,
+                         mechanical_imports = algorithm == "current_root_joint_kernel" ? 1 : attempts,
+                         elapsed_ms = wall.Elapsed.TotalMilliseconds, import_ms = importMs, kernel_ms = kernelMs,
+                         rejected_public_evidence_counts = rejectedEvidence,
                          encounter_suffix_commitment = SampledEncounterSuffixCommitment(),
                          event_suffix_commitment = SampledEventSuffixCommitment(),
                          relic_suffix_commitment = SampledRelicSuffixCommitment(),
+                         future_rng_commitment = SampledRunFutureRngCommitment(),
+                         joint_latent_commitment = SampledRunJointLatentCommitment(),
                          closed_domains = new[] { "public", "public_derived", "encounters", "events", "relics", "future_rng" } } };
     }
 

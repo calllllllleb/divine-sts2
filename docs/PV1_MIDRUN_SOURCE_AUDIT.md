@@ -2,6 +2,11 @@
 
 Author: XuShuxi
 
+The current-root kernel's additional targeted native field/RNG census and
+replacement denominator are recorded in
+[PV1_CURRENT_ROOT_KERNEL.md](PV1_CURRENT_ROOT_KERNEL.md). This does not expand
+the persistent/quest or producer families certified below.
+
 This is a targeted audit for STS2 v0.107.1, build
 `v0.107.1_a1f9e653f1e2_42520eb8b091`. It reuses the exact-build extraction in
 `calllllllleb/sts2-rl-core@13d6fbee40d176aa5018ca402345259e3e274a0f`; it does

@@ -144,10 +144,12 @@ public sealed partial class PersistentNativeCombatEnvironment
         foreach (string? potion in player.Potions) if (potion is not null) ValidatePersistentRunModel(Mutable("AllPotions", potion));
     }
 
+    private static string RunSearchPriorSeed(long entropy, int attempt) => $"run-search-{entropy:X16}-{attempt:X8}";
+
     private ResetRequest IndependentRunReset(RunInitializationFacts initialization, long entropy, int attempt)
     {
         RunPlayerFacts loadout = initialization.Loadout;
-        return new(new(_productVersion, _assemblyHash, _pckHash), $"run-search-{entropy:X16}-{attempt:X8}", null,
+        return new(new(_productVersion, _assemblyHash, _pckHash), RunSearchPriorSeed(entropy, attempt), null,
             initialization.Character, initialization.Ascension, "first", loadout.CurrentHp, loadout.MaxHp,
             initialization.UseCharacterStartingLoadout ? [] : loadout.Deck.Select((card, i) => new CardSpec($"public-initial-{i}", card.ModelId, card.Upgrades, null,
                 card.Enchantment is null ? null : new(card.Enchantment.ModelId, card.Enchantment.Amount))).ToArray(), [],

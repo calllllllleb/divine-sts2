@@ -9,6 +9,13 @@ Mechanics authority: shipped STS2 v0.107.1, build
 census are in [PV1_MIDRUN_SOURCE_AUDIT.md](PV1_MIDRUN_SOURCE_AUDIT.md).
 General mid-run composition is **not globally certified**.
 
+Current production status (October 6 kernel delivery): composition v5 uses one
+current mechanical import and a bounded native joint latent kernel. Whole-prior
+Run reconstruction is reference-only; production cannot fall back to it.
+The complete replacement denominator, protocol mapping, source scope and gates
+are in [PV1_CURRENT_ROOT_KERNEL.md](PV1_CURRENT_ROOT_KERNEL.md). Existing producer,
+persistent-instance and quest fail-closed contracts below remain in force.
+
 ## One public owner, two composition layers
 
 Agent PolicyVisibleState remains the only model fact owner. Its existing
@@ -42,7 +49,7 @@ it generates the exact native joint prior and can verify small-root conditional
 distributions. It must not be optimized into the long-term production path by
 raising attempt budgets or weakening public evidence.
 
-The production path is now:
+The implemented production path is now:
 
 ```text
 current live Run boundary
@@ -260,8 +267,10 @@ Skin state. This is not a blanket `unsupported_run_quest_domain` claim.
 
 ## Information and factual boundaries
 
-Search-private RPCs are export_run_root, compose_run_root and export_run_combat_root.
-The composition-v4 receipt has attempt count and sampled suffix commitments only
+Search-private RPCs are export_run_root, export_run_mechanical_root,
+compose_run_root and export_run_combat_root. compose_run_root_reference is an
+explicit regression oracle. The composition-v5 receipt has algorithm/import
+count, timings, evidence rejection counts and sampled suffix/joint/RNG commitments only
 for private acceptance diagnostics. It certifies the six named generator domains
 only for an accepted supported root, not every vanilla inventory/modal family.
 No receipt, commitment, entropy or native root enters model input or teacher data.
@@ -295,6 +304,7 @@ world and seven 8192-attempt exhaustions. After the architecture audit this fail
 is treated as evidence that whole-prior rejection is the wrong production
 mid-run substrate, not merely as a request to increase the attempt budget.
 
-General mid-run composition remains unclosed. The next implementation phase is
-the current-root import/sanitization kernel before returning to the remaining
-producer/instance closure groups.
+General mid-run composition remains unclosed. That architecture correction is
+now implemented by RunCompositionKernel.cs. Historical exhaustion evidence above
+is retained: bounded conditioning can still exhaust in the smaller latent kernel.
+This round does not expand the remaining producer/instance closure groups.

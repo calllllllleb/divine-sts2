@@ -100,7 +100,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         protocol_version = ProtocolConstants.Version, observation_schema_version = ProtocolConstants.ObservationSchemaVersion,
         server = "sts2-native-sim-godot", persistent = true, certifying = false,
         game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
-        methods = new[] { "hello", "catalog", "reset", "run_reset", "map_reset", "reward_reset", "item_reward_reset", "custom_reward_reset", "rest_reset", "event_reset", "observe", "run_observe", "map_observe", "reward_observe", "custom_reward_observe", "rest_observe", "event_observe", "legal_actions", "step", "run_step", "map_step", "reward_step", "custom_reward_step", "rest_step", "event_step", "fork", "restore", "export_run_root", "compose_run_root", "export_run_combat_root", "export_combat_root", "import_combat_root", "resample_draw_order", "fork_future_rng", "describe_monster_move_candidates", "describe_monster_move_rules", "describe_monster_roll_events", "describe_monster_transient_events", "describe_monster_immediate_rule", "describe_monster_roll_rules", "reconstruct_monster_moves", "describe_monster_rng_provenance", "diagnostics", "close" },
+        methods = new[] { "hello", "catalog", "reset", "run_reset", "map_reset", "reward_reset", "item_reward_reset", "custom_reward_reset", "rest_reset", "event_reset", "observe", "run_observe", "map_observe", "reward_observe", "custom_reward_observe", "rest_observe", "event_observe", "legal_actions", "step", "run_step", "map_step", "reward_step", "custom_reward_step", "rest_step", "event_step", "fork", "restore", "export_run_root", "export_run_mechanical_root", "compose_run_root", "compose_run_root_reference", "export_run_combat_root", "export_combat_root", "import_combat_root", "resample_draw_order", "fork_future_rng", "describe_monster_move_candidates", "describe_monster_move_rules", "describe_monster_roll_events", "describe_monster_transient_events", "describe_monster_immediate_rule", "describe_monster_roll_rules", "reconstruct_monster_moves", "describe_monster_rng_provenance", "diagnostics", "close" },
         supported_subset = new { characters = "native CharacterModel entries", encounters = "native EncounterModel entries", cards = "base/upgraded cards plus asynchronous native card, bundle, and relic choices", actions = new[] { "play_card", "use_potion", "discard_potion", "end_turn", "choose_cards", "choose_option", "choose_map", "choose_reward", "choose_rest", "choose_event", "open_treasure", "choose_treasure", "buy_shop", "choose_custom_reward", "skip_custom_rewards", "advance_act" }, potions = true, map = "native deterministic routing graph with composed combat, rest, event, treasure, shop, and inter-act transitions", events = "native model initialization, option continuations, nested event-created combats, blocking custom/linked rewards, and the final victory event" }
     };
 
@@ -174,7 +174,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         => ResetCore(request, runPriorOnly: false)!;
 
     // XuShuxi: Prior trials use native initialization without bootstrap combat.
-    private EnvironmentResult? ResetCore(ResetRequest request, bool runPriorOnly)
+    private EnvironmentResult? ResetCore(ResetRequest request, bool runPriorOnly, RunMechanicalSnapshot? mechanicalRoot = null)
     {
         ThrowIfPoisoned();
         _monsterRollEvents.Clear();
@@ -190,7 +190,10 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         _cardInstanceIds.Clear();
         _combatCreaturesById.Clear();
         if (!runPriorOnly) GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-        _runRoomCoords.Clear(); _runMode = false; _runStage = "map"; _runWon = false; _roomRewardsSet = null; _resolvedRoomRewards.Clear(); _pendingRoomRewardIndex = null; _pendingRewardsSet = null; _pendingRewardSelection = null; _customRewardMode = false; _customRewardsLinked = false; _customRewardKinds = []; _treasureRoom = null; _treasureSynchronizer = null; _treasureOpened = false; _treasureResolved = false; _merchantRoom = null; _merchantInventory = null; _merchantEntryIdentities.Clear(); _mapMode = false; _rewardMode = false; _rewardKind = "card"; _rewardModelId = null; _cardReward = null; _restMode = false; _eventMode = false; _eventId = null; _event = null; Validate(request); _reset = request; _history.Clear(); _currentBranchHandle = null; _lastActionId = null; Construct(request, runPriorOnly);
+        // XuShuxi: A mechanical import was already validated by the strict Run
+        // public contract. Reset's opening-loadout slot limit does not describe
+        // a current public potion belt expanded by native gameplay.
+        _runRoomCoords.Clear(); _runMode = false; _runStage = "map"; _runWon = false; _roomRewardsSet = null; _resolvedRoomRewards.Clear(); _pendingRoomRewardIndex = null; _pendingRewardsSet = null; _pendingRewardSelection = null; _customRewardMode = false; _customRewardsLinked = false; _customRewardKinds = []; _treasureRoom = null; _treasureSynchronizer = null; _treasureOpened = false; _treasureResolved = false; _merchantRoom = null; _merchantInventory = null; _merchantEntryIdentities.Clear(); _mapMode = false; _rewardMode = false; _rewardKind = "card"; _rewardModelId = null; _cardReward = null; _restMode = false; _eventMode = false; _eventId = null; _event = null; if (mechanicalRoot is null) Validate(request); _reset = request; _history.Clear(); _currentBranchHandle = null; _lastActionId = null; Construct(request, runPriorOnly, mechanicalRoot);
         try
         {
             object? runManager = ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance");
@@ -1236,7 +1239,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         InstallSeam(); InstallChoiceSelector();
     }
 
-    private void Construct(ResetRequest r, bool runPriorOnly = false)
+    private void Construct(ResetRequest r, bool runPriorOnly = false, RunMechanicalSnapshot? mechanicalRoot = null)
     {
         Type db = T("MegaCrit.Sts2.Core.Models.ModelDb"), playerType = T("MegaCrit.Sts2.Core.Entities.Players.Player");
         // Cancel and detach every shipped combat continuation before replacing the
@@ -1299,7 +1302,24 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             if (previousReplayWriter is not null) ReflectionTools.Invoke(previousReplayWriter, "Dispose");
             ReflectionTools.Set(runManager, "State", null);
         }
-        ReflectionTools.Invoke(runManager, "SetUpTest", _run, ReflectionTools.Create(T("MegaCrit.Sts2.Core.Multiplayer.NetSingleplayerGameService")), true, false);
+        if (mechanicalRoot is null)
+            ReflectionTools.Invoke(runManager, "SetUpTest", _run, ReflectionTools.Create(T("MegaCrit.Sts2.Core.Multiplayer.NetSingleplayerGameService")), true, false);
+        else
+        {
+            // XuShuxi: Import current mechanics. Do NOT run InitializeNewRun:
+            // ascension/starter hooks have already happened, and no initial bag
+            // population or gameplay replay belongs to this mechanical import.
+            object net = ReflectionTools.Create(T("MegaCrit.Sts2.Core.Multiplayer.NetSingleplayerGameService"));
+            ReflectionTools.Set(runManager, "State", _run);
+            ReflectionTools.Invoke(runManager, "InitializeShared", net,
+                ReflectionTools.Create(T("MegaCrit.Sts2.Core.Multiplayer.Game.PeerInput.PeerInputSynchronizer"), net),
+                false, null, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), 0L, 0L, 0);
+            ReflectionTools.Invoke(runManager, "InitializeRunLobby", net, _run);
+            ReflectionTools.Set(ReflectionTools.Get(runManager, "CombatStateSynchronizer")!, "IsDisabled", true);
+            ReflectionTools.Set(_player, "MaxEnergy", mechanicalRoot.BaseMaxEnergy);
+            ReflectionTools.Set(_player, "BaseOrbSlotCount", mechanicalRoot.BaseOrbSlotCount);
+            ReflectionTools.Set(ReflectionTools.Get(_run, "ExtraFields")!, "StartedWithNeow", mechanicalRoot.StartedWithNeow);
+        }
         _runServicesInitialized = true;
         ReflectionTools.Set(ReflectionTools.Get(runManager, "CombatReplayWriter")!, "IsEnabled", false);
         ReflectionTools.SetStatic(T("MegaCrit.Sts2.Core.Context.LocalContext"), "NetId", (ulong?)1);

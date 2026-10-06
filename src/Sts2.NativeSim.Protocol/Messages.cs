@@ -154,7 +154,17 @@ public sealed record RunRelicOperationFacts(
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record ComposeRunRootRequest(
     [property: JsonPropertyName("root"), JsonRequired] PortableRunRoot Root,
-    [property: JsonPropertyName("search_entropy"), JsonRequired] long SearchEntropy);
+    [property: JsonPropertyName("search_entropy"), JsonRequired] long SearchEntropy,
+    [property: JsonPropertyName("mechanical_root")] RunMechanicalSnapshot? MechanicalRoot = null);
+// XuShuxi: One private mechanical anchor, bound to the existing public owner.
+// This is deliberately not a save/NativeState/RNG bag. No native identity survives.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunMechanicalSnapshot(
+    [property: JsonPropertyName("schema_version"), JsonRequired] int SchemaVersion,
+    [property: JsonPropertyName("public_root_sha256"), JsonRequired] string PublicRootSha256,
+    [property: JsonPropertyName("base_max_energy"), JsonRequired] int BaseMaxEnergy,
+    [property: JsonPropertyName("base_orb_slot_count"), JsonRequired] int BaseOrbSlotCount,
+    [property: JsonPropertyName("started_with_neow"), JsonRequired] bool StartedWithNeow);
 public sealed record EventResetRequest(
     [property: JsonPropertyName("state")] ResetRequest State,
     [property: JsonPropertyName("event_id")] string EventId);
