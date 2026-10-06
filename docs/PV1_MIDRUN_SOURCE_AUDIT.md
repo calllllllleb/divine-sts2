@@ -8,6 +8,53 @@ This is a targeted audit for STS2 v0.107.1, build
 not repeat the 3425-file source-universe audit. The shipped DLL remains the runtime
 mechanics authority. The simulator is evidence, never a replacement backend.
 
+## 2026-10-06 architecture conclusion from this source audit
+
+This audit now has an explicit architecture consequence.
+
+The source evidence supports **current-root mechanical import followed by complete
+hidden-future sanitization** as the production Run composition direction. It does
+not support continuing to rebuild the entire Run from its initial prior and
+rejecting whole worlds until the already-observed historical prefix reappears.
+
+The replacement matrix is:
+
+| Native domain | Current-root treatment |
+| --- | --- |
+| HP/max HP/gold/current certified deck/relic/potion state | COPY_SAFE_CURRENT / PUBLIC_REBUILD |
+| completed public map topology/current boss/visited coords/room history | COPY_SAFE_CURRENT / PUBLIC_REBUILD |
+| public unknown-room/card-rarity/potion odds and shop removal count | PUBLIC_REBUILD |
+| unresolved Unknown room future | FUTURE_RNG_REPLACE using search-local UnknownMapPoint |
+| encounter/event/ancient/boss hidden suffix | JOINT_CONDITIONAL_RESAMPLE |
+| shared/player relic-bag hidden suffix | JOINT_CONDITIONAL_RESAMPLE |
+| factual RunRngSet / PlayerRngSet continuation | FUTURE_RNG_REPLACE |
+| ordinary reward / Rest / Smith / ordinary Treasure current producer | PRODUCER_REGENERATE |
+| Shop / current Event / custom reward / generic choice | UNSUPPORTED until producer-specific closure |
+| unaudited persistent Card/Relic/Potion state | PUBLIC_REBUILD / TRANSIENT_IGNORE only when source-proven; otherwise UNSUPPORTED |
+| FUR_COAT / SPOILS_MAP quest state | PUBLIC_REBUILD from certified marker/history; otherwise UNSUPPORTED |
+| combat-local state | existing Combat composition owner |
+
+A critical source constraint is that `RunRng.UpFront` is shared by an ordered
+native generation graph that includes relic-bag population and RunManager/Act room
+generation. Therefore encounter, event and relic latent suffixes must not be
+replaced by independent marginal samplers unless a future source proof establishes
+the needed conditional independence.
+
+The old joint whole-prior rejection implementation remains useful as a bounded
+reference oracle for small-root distribution checks because it naturally preserves
+this correlation. It is not the production mid-run strategy.
+
+The production close condition is stronger than public equality:
+
+```text
+same public root
++ same search entropy
++ different factual hidden future
+→ same composed latent commitment
+```
+
+This gate must pass before a current-root importer is considered belief-safe.
+
 ## Rules used
 
 The three generated contracts are `sts2_env/data/generated/encounter_event_rules.json`,
