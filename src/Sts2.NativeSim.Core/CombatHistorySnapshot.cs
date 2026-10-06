@@ -453,19 +453,7 @@ public sealed partial class PersistentNativeCombatEnvironment
         if (playerId != 0 || netId != 1 || creatureIds.Contains(playerId))
             throw new ProtocolException("invalid_combat_history", "History player binding is outside the pinned single-player initialization profile.");
         creatureIds.Add(playerId);
-        foreach (PowerSnapshot power in snapshot.PlayerPowers.Concat(snapshot.Enemies.SelectMany(e => e.Powers))
-            .Concat(snapshot.OstyEntity?.Entity?.Powers ?? []))
-        {
-            if (HasReviewedPowerRuntime(power.ModelId) != (power.Runtime is not null))
-                throw new ProtocolException("unsupported_power_runtime", "Reviewed resident Power requires its exact basic runtime state.");
-            if (power.Runtime is not { } runtime) continue;
-            if (runtime.ApplierCombatId is uint a && !creatureIds.Contains(a)
-                || runtime.TargetCombatId is uint t && !creatureIds.Contains(t))
-                throw new ProtocolException("invalid_history_reference", "Resident Power Applier/Target is absent from the saved Creatures.");
-            object model = ReflectionTools.Invoke(Find(ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Models.ModelDb"), "AllPowers")!, power.ModelId), "ToMutable", 0)!;
-            ValidateResidentPowerAbi(model, "Power", "Resident.Power");
-            ValidatePowerDynamicVars(power.ModelId, runtime.DynamicVars, "Resident.Power.DynamicVars");
-        }
+        ValidateResidentPowerDescriptors(snapshot, creatureIds);
         List<PowerSnapshot>? Powers(uint id) => id == playerId ? snapshot.PlayerPowers
             : snapshot.OstyEntity?.Entity is { } pet && pet.CombatId == id ? pet.Powers
             : snapshot.Enemies.SingleOrDefault(e => e.CombatId == id)?.Powers;

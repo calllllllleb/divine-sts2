@@ -435,7 +435,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         if (!CombatHistoryFingerprintMatches(snapshot, actual))
             throw new ProtocolException("combat_root_history_mismatch", "Imported shared history fingerprint differs.");
         if (!PlayerPowerRuntimeFingerprintMatches(snapshot, actual))
-            throw new ProtocolException("combat_root_power_mismatch", "Imported reviewed player Power runtime differs.");
+            throw new ProtocolException("combat_root_power_mismatch", "Imported player Power references/runtime fingerprint differs.");
         timer.Stop();
         return imported with { Transition = new { kind = "portable_combat_root_import", replayed_actions = 0, elapsed_ms = timer.Elapsed.TotalMilliseconds } };
     }
@@ -4287,6 +4287,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                         amount,
                         saved,
                         pId == "CHAINS_OF_BINDING_POWER" ? CaptureBoundCardPlayed(p) : null,
+                        CapturePowerReferences(p, ownerCreature, $"Creature[{CreatureIdentity(ownerCreature)}].Powers[{list.Count}]({pId}).References"),
                         HasReviewedPowerRuntime(pId) ? CaptureResidentPowerRuntime(p) : null
                     ));
                 }
@@ -4834,35 +4835,9 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         ValidateResidentPowerAbi(power, "Power", "Resident.Power");
         if (ReflectionTools.Get(power, "_internalData") is not null)
             throw new ProtocolException("unsupported_power_runtime", "Reviewed resident Power has unknown private data.");
-        uint? Id(object? creature)
-        {
-            if (creature is null) return null;
-            if (!ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Creatures")).Any(c => ReferenceEquals(c, creature)))
-                throw HistoryReferenceError("Resident.Power.Reference", $"Nonresident {creature.GetType().FullName} requires a separate live Power carrier.");
-            return CreatureIdentity(creature);
-        }
-        return new(Id(ReflectionTools.Get(power, "Applier")), Id(ReflectionTools.Get(power, "Target")),
+        return new(
             (int)ReflectionTools.Get(power, "AmountOnTurnStart")!, (bool)ReflectionTools.Get(power, "SkipNextDurationTick")!,
             CapturePowerDynamicVars(power, "Resident.Power.DynamicVars"), (string?)ReflectionTools.Get(power, "_resolvedBigIconPath"));
-    }
-
-    private void RestoreResidentPowerReferences(CombatSnapshot snapshot)
-    {
-        object Creature(uint id) => ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Creatures"))
-            .Single(c => c is not null && CreatureIdentity(c) == id)!;
-        void Bind(object creature, List<PowerSnapshot> snapshots)
-        {
-            var powers = ReflectionTools.Enumerate(ReflectionTools.Get(creature, "Powers"));
-            for (int i = 0; i < snapshots.Count; i++)
-                if (snapshots[i].Runtime is { } runtime)
-                {
-                    ReflectionTools.Set(powers[i]!, "_applier", runtime.ApplierCombatId is uint a ? Creature(a) : null);
-                    ReflectionTools.Set(powers[i]!, "_target", runtime.TargetCombatId is uint t ? Creature(t) : null);
-                }
-        }
-        Bind(ReflectionTools.Get(_player!, "Creature")!, snapshot.PlayerPowers);
-        foreach (EnemySnapshot enemy in snapshot.Enemies) Bind(Creature(enemy.CombatId), enemy.Powers);
-        if (snapshot.OstyEntity?.Entity is { } osty) Bind(Creature(osty.CombatId), osty.Powers);
     }
 
     private static void ApplyNativeProperties(object model, IReadOnlyDictionary<string, object?>? props)
@@ -4949,17 +4924,17 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         int AfflictionAmount = 0,
         IReadOnlyDictionary<string, object?>? AfflictionSavedProperties = null);
 
+    [System.Text.Json.Serialization.JsonUnmappedMemberHandling(System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow)]
     private sealed record PowerSnapshot(
         string ModelId,
         int Amount,
         IReadOnlyDictionary<string, object?> SavedProperties,
         [property: System.Text.Json.Serialization.JsonRequired] bool? BoundCardPlayed,
+        [property: System.Text.Json.Serialization.JsonRequired] PowerReferences References,
         [property: System.Text.Json.Serialization.JsonRequired] ResidentPowerRuntime? Runtime);
 
     [System.Text.Json.Serialization.JsonUnmappedMemberHandling(System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow)]
     private sealed record ResidentPowerRuntime(
-        [property: System.Text.Json.Serialization.JsonRequired] uint? ApplierCombatId,
-        [property: System.Text.Json.Serialization.JsonRequired] uint? TargetCombatId,
         [property: System.Text.Json.Serialization.JsonRequired] int AmountOnTurnStart,
         [property: System.Text.Json.Serialization.JsonRequired] bool SkipNextDurationTick,
         [property: System.Text.Json.Serialization.JsonRequired] PowerDynamicVarSet? DynamicVars,

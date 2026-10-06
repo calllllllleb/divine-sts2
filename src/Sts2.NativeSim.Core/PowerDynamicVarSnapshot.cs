@@ -112,11 +112,8 @@ public sealed partial class PersistentNativeCombatEnvironment
     private static bool PlayerPowerRuntimeFingerprintMatches(CombatSnapshot expected, CombatSnapshot actual)
     {
         // Enemy/Osty fingerprints already cover their complete PowerSnapshot lists.
-        // The player needs the same exact guard for these reviewed runtime carriers.
-        object Reviewed(CombatSnapshot snapshot) => snapshot.PlayerPowers
-            .Select((power, index) => new { Index = index, Power = power })
-            .Where(p => HasReviewedPowerRuntime(p.Power.ModelId)).ToArray();
-        return System.Text.Json.JsonSerializer.Serialize(Reviewed(expected), PortableRootJson)
-            == System.Text.Json.JsonSerializer.Serialize(Reviewed(actual), PortableRootJson);
+        // Every player Power must carry and match common references, including unreviewed runtimes.
+        return System.Text.Json.JsonSerializer.Serialize(expected.PlayerPowers, PortableRootJson)
+            == System.Text.Json.JsonSerializer.Serialize(actual.PlayerPowers, PortableRootJson);
     }
 }
