@@ -10,7 +10,7 @@ High-throughput, deterministic, headless reinforcement learning and MCTS executi
 
 Executes game mechanics directly from your local Steam installation inside isolated, presentation-suppressed .NET 9 workers. Contains zero copyrighted assets, game binaries, or proprietary art.
 
-Portable combat roots require schema 6 / shared history v5 and the fixed-DLL history consumption contract. History-only native type/ID carriers keep dead enemy identity without future FSM reconstruction; live state and executable cards retain their existing codecs. Normal starter seed42 crosses TwigSlimeS and wins its first two fights. Queen/Nibbit, Weak/Vulnerable and a real DeathsDoor type-predicate witness pass. General training closure remains open. See [the current contract and native evidence](docs/SHARED_COMBAT_HISTORY.md).
+Portable combat roots require schema 7 / shared history v5 and the fixed-DLL history consumption contract. Cards retain versioned actual DynamicVars and SovereignBlade private damage/repeats; native Forge damage and zero-replay branch restoration are verified. See [card dynamic runtime scope and native evidence](docs/CARD_DYNAMIC_RUNTIME.md). History-only native type/ID carriers keep dead enemy identity without future FSM reconstruction. General training closure remains open. See [the shared history contract](docs/SHARED_COMBAT_HISTORY.md).
 
 ---
 
@@ -127,4 +127,3 @@ STS2_GAME_ROOT=D:\SteamLibrary\steamapps\common\Slay the Spire 2
 ## Legal
 
 `divine-sts2` is an independent research project and is not affiliated with or endorsed by Mega Crit. Users must provide their own legally obtained copy of Slay the Spire 2. Distributed under the [MIT License](LICENSE).
-

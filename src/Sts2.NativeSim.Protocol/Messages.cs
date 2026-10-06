@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 
 namespace Sts2.NativeSim.Protocol;
 
-public static class ProtocolConstants { public const int Version = 1; public const int ObservationSchemaVersion = 2; public const int CombatRootSchemaVersion = 6; }
+public static class ProtocolConstants { public const int Version = 1; public const int ObservationSchemaVersion = 2; public const int CombatRootSchemaVersion = 7; }
 public sealed record RpcRequest([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("method")] string Method, [property: JsonPropertyName("params")] JsonElement Parameters);
 public sealed record RpcResponse([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("ok")] bool Ok, [property: JsonPropertyName("result")] object? Result = null, [property: JsonPropertyName("error")] ProtocolError? Error = null);
 public sealed record ProtocolError([property: JsonPropertyName("code")] string Code, [property: JsonPropertyName("message")] string Message, [property: JsonPropertyName("details")] object? Details = null);
