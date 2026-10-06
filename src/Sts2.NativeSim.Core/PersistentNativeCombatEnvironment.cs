@@ -165,10 +165,24 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         }
         return new
         {
+            public_input_catalog_version = 1,
             game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
             cards = Cards(), encounters = Encounters(), monsters = Models("Monsters"), relics = Models("AllRelics"),
             potions = Models("AllPotions"), characters = Models("AllCharacters"),
-            enchantments = Models("DebugEnchantments"), events = Models("AllEvents")
+            enchantments = Models("DebugEnchantments"), events = Models("AllEvents"),
+            powers = Models("AllPowers"), orbs = Models("Orbs"), afflictions = Models("DebugAfflictions"),
+            // Static type identities include generated/debug models omitted by pool lists.
+            // GetEntry(Type) reads ModelDb's ID naming rule, without creating a run/model instance.
+            model_types = PublicInputModelTypes(db),
+            enums = PublicInputEnums(),
+            localization_keys = PublicInputLocalizationKeys(),
+            rest_option_ids = PublicInputRestOptionIds(),
+            provenance = new
+            {
+                source = "ModelDb + fixed assembly type identities/enums + loaded English localization keys",
+                run_state_read = false, event_options_invoked = false,
+                text_key_scope = "installed static localization table keys; runtime-composed keys require explicit public supplements"
+            }
         };
     }
 
