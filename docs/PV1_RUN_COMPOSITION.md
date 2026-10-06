@@ -32,46 +32,189 @@ NativeState, native identity, future queues, private mutable state or a handle.
 CanBeModified flag is omitted. Quest installation uses public ownership and the
 source census, never marker boolean as a guessed identity.
 
-## Joint posterior and finite rejection
+## Corrected production composition: current mechanical root + hidden-future sanitization
 
-For each independent search entropy, every candidate creates a new native Run
-and executes the complete RunManager.GenerateRooms prior. The shared Ancient
-subset allocation, shuffled events, weighted no-repeat encounter generation,
-relic bags, tutorial modifications and DoubleBoss behavior stay native.
+The October 6 architecture audit supersedes **whole-Run rejection from the
+initial prior** as the production mid-run strategy.
 
-`Z ~ native prior`; accept exactly when replay is consistent with relevant public
-history H. Accepted worlds therefore condition this joint prior on H. No resident
-factual suffix, factual seed or factual counter participates. Future randomness
-belongs to this independent search-local world.
+The existing implementation remains valuable as a source-backed reference oracle:
+it generates the exact native joint prior and can verify small-root conditional
+distributions. It must not be optimized into the long-term production path by
+raising attempt budgets or weakening public evidence.
 
-Encounter replay calls PullNextEncounter/MarkRoomVisited in public act/category
-order and matches every observed model; public current boss/second boss also match.
-Event evidence records historical public eligibility ids, floor, LanternKey
-presence, observed final id and chronological operation position. Native cyclic
-scan, visited exclusion, hook fold and repetition fallback execute during replay.
-LuminousChoir is handled by its public gold predicate and that sampled world's
-native bag-availability query, preserving the joint event/bag dependency.
+The production path is now:
 
-Relic evidence records ordered shared/player operations, producer, floor/act,
-source rarity roll or requested rarity, front/back direction, audited filter and
-public blacklist, causal removal reference and the revealed model id. Unrevealed
-pull identity stays null; only the sampled native world materializes it. Replay
-executes native filtering, refresh, rarity fallback and pull/remove behavior at
-that historical public context. The old unordered depletion is a derived view.
-Unknown filters/RNG-override producers reject with their named source reason.
-Unaudited third bag observations are quarantined for root export, without throwing
-inside factual mechanics or inventing a player bag owner. Revealed depletion in a
-known player/shared bag remains public even if its composition producer rejects.
-Factual reset-private overrides, including nonempty supplied RNG counters, reject
-at root export and are never transferred into initialization parameters.
+```text
+current live Run boundary
+    ↓
+public PortableRunRoot
++
+composer-private current mechanical substrate
+    ↓
+import into isolated native search authority
+    ↓
+sanitize factual hidden future
+    ↓
+reconstruct/condition native joint latent generator
+    ↓
+replace all future RNG
+    ↓
+producer-specific current-boundary regeneration
+    ↓
+public state/actions exact gate
+    ↓
+RunWorld
+```
 
-Maximum attempts per composition request: **8192**. Exhaustion returns
-`run_composition_attempts_exhausted` with domain, attempt count, first contradicted
-public evidence and rejection counts. It never becomes a death outcome, factual
-fallback or ignored evidence. The Python client uses a separate finite composition
-watchdog (default 600 seconds); ordinary request timeouts retain their own limit.
-Rare long observed prefixes can exhaust this budget. Faster correct conditioning
-is performance work; deleting prefix constraints is not an optimization.
+### Mechanical substrate is private, not model state
+
+`PortableRunRoot` remains a strict public/public-derived DTO. It must continue to
+reject seed, RNG counters, NativeState bags, native identities, hidden queues and
+worker handles.
+
+A separate composer-private substrate may carry the current mechanical anchor
+needed to avoid replaying the entire factual run from floor 1. This is analogous
+to Combat's private snapshot substrate.
+
+It must never enter:
+
+```text
+PolicyVisibleState
+DecisionTable / tensors
+RunInformationState identity
+training records
+teacher provenance
+model features
+```
+
+and it must not be stepped until the hidden-future sanitization denominator is
+closed for that root family.
+
+### Required field classification
+
+Every future-relevant field reachable from the imported current substrate must be
+classified as exactly one of:
+
+```text
+COPY_SAFE_CURRENT
+PUBLIC_REBUILD
+JOINT_CONDITIONAL_RESAMPLE
+FUTURE_RNG_REPLACE
+PRODUCER_REGENERATE
+TRANSIENT_IGNORE
+UNSUPPORTED
+```
+
+The current public resource/map/history rehydration already provides much of
+`COPY_SAFE_CURRENT` and `PUBLIC_REBUILD`.
+
+`UNSUPPORTED` must remain fail closed. A raw factual private value is never a
+valid substitute for a missing reconstruction contract.
+
+### Joint UpFront latent generator
+
+Do **not** rewrite the latent future as independent encounter/event/relic marginals.
+
+For this exact build, source evidence shows an ordered `RunRng.UpFront` generation
+graph spanning at least:
+
+```text
+shared relic-bag population
+player relic-bag population
+RunManager.GenerateRooms / ActModel.GenerateRooms
+encounter/event/ancient/boss upfront materialization
+```
+
+The composer must preserve the native joint law.
+
+Conceptually:
+
+```text
+search-local UpFront
+→ native ordered latent generation
+→ condition on public encounter/event/relic evidence
+→ retain only a consistent hidden suffix
+```
+
+Bounded rejection/constraint sampling is allowed **inside this joint latent
+generator kernel** where exact conditioning requires it.
+
+What is retired from production is:
+
+```text
+fresh initial Run
+→ regenerate all current mechanics
+→ require the complete historical prefix to reoccur
+→ whole-world rejection up to 8192 attempts
+```
+
+Already-public boss identity, map topology, current resources and completed room
+history are not probabilistic targets and must not be re-discovered by chance.
+
+### Future RNG replacement
+
+The imported current substrate cannot keep factual RNG continuation.
+
+Replace all future-relevant named streams with search-local continuation,
+including the applicable streams in:
+
+```text
+RunRngSet
+PlayerRngSet
+```
+
+Examples include UnknownMapPoint, TreasureRoomRelics, reward/shop/transform RNG
+and later combat RNG.
+
+Nested combat continues to use FR1B2/FR1C from the then-public combat boundary.
+
+### Safe map treatment
+
+The completed public map topology is a safe current mechanical fact and should be
+retained.
+
+An unresolved Unknown map point does not contain a public future room result. Its
+future resolution must consume the search world's replacement
+`RunRng.UnknownMapPoint` and current public odds/history.
+
+### Current producer treatment
+
+Current screen/continuation owners remain producer-specific. A copied resident
+producer object is not automatically safe because it may already contain an
+unrevealed factual result.
+
+The existing certified ordinary reward, Rest/Smith and ordinary Treasure
+regeneration contracts remain valid and should be preserved.
+
+Shop, current Event, custom reward and generic choice remain fail closed until
+their own producer-specific public reconstruction contracts are certified.
+
+A pre-open Treasure is the canonical negative example: the public chest may be
+copied/rebuilt, but any resident unrevealed relic materialization must be replaced
+by the sampled world's result before the producer is regenerated.
+
+### Mandatory hidden-future isolation gates
+
+New production composition is not CLOSED without both:
+
+```text
+Gate A:
+same public root
++ same search entropy
++ deliberately different factual hidden futures
+→ same composed latent commitment / same search-world semantics
+
+Gate B:
+same public root
++ different search entropy
+→ exact same public root/actions
+→ hidden commitments show diversity
+```
+
+Gate A detects any factual hidden field that survived sanitization. Gate B proves
+that the composer is not cloning a single future.
+
+The existing public equality and factual invariance gates remain mandatory.
 
 ## Producer-specific current boundary regeneration
 
@@ -144,9 +287,14 @@ completed victory at 339 boundaries / 45 rooms / 27 encounters.
 
 The Treasure current-screen/continuation gate passed on real seed-74 public
 history: search entropy 95007 accepted after 7120 native candidates, pre-open and
-opened public state/actions matched, and native obtain/leave/map completed. Only
-one independent entropy witness is certified here. The preceding two-world target
-failed: eight bounded requests yielded one accepted world and seven 8192-attempt
-exhaustions. This failure is not converted into a diversity certificate. General
-mid-run composition remains unclosed; the Agent report lists each producer and
-instance gap rather than a compressed single blocker.
+opened public state/actions matched, and native obtain/leave/map completed. This
+remains valid evidence for the producer regeneration contract.
+
+The preceding two-world target failed: eight bounded requests yielded one accepted
+world and seven 8192-attempt exhaustions. After the architecture audit this failure
+is treated as evidence that whole-prior rejection is the wrong production
+mid-run substrate, not merely as a request to increase the attempt budget.
+
+General mid-run composition remains unclosed. The next implementation phase is
+the current-root import/sanitization kernel before returning to the remaining
+producer/instance closure groups.
