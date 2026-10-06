@@ -10,7 +10,7 @@ High-throughput, deterministic, headless reinforcement learning and MCTS executi
 
 Executes game mechanics directly from your local Steam installation inside isolated, presentation-suppressed .NET 9 workers. Contains zero copyrighted assets, game binaries, or proprietary art.
 
-Portable combat roots require schema 4 / shared history v3. Bounded dead Torch Head Amalgam and Nibbit history supports native cross-worker continuation and prior alive-branch restoration. The removed WeakPower DynamicVar path remains unsupported; this is not a complete general training baseline. See [the current contract and native evidence](docs/SHARED_COMBAT_HISTORY.md).
+Portable combat roots require schema 5 / shared history v4. Weak/Vulnerable use bounded constant DynamicVar carriers for native expiry and cross-worker continuation; the original Queen/Waterfall regression passes. deadMonster remains restricted to TorchHeadAmalgam/Nibbit; this is not a complete general training baseline. See [the current contract and native evidence](docs/SHARED_COMBAT_HISTORY.md).
 
 ---
 

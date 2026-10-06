@@ -10,7 +10,7 @@ namespace Sts2.NativeSim.Core;
 public sealed partial class PersistentNativeCombatEnvironment
 {
     // Internal reference numbers are local to this payload, never policy features.
-    private const int CombatHistoryContractVersion = 3;
+    private const int CombatHistoryContractVersion = 4;
     private const string HistoryEntryNamespace = "MegaCrit.Sts2.Core.Combat.History.Entries.";
     [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
     private sealed record CombatHistorySnapshot([property: JsonRequired] int Version,
@@ -60,7 +60,7 @@ public sealed partial class PersistentNativeCombatEnvironment
     private sealed record HistoricalPower([property: JsonRequired] int? Owner,
         [property: JsonRequired] int? Applier, [property: JsonRequired] int? Target,
         [property: JsonRequired] int Amount, [property: JsonRequired] int AmountOnTurnStart,
-        [property: JsonRequired] bool SkipNextDurationTick, [property: JsonRequired] bool DynamicVarsInitialized,
+        [property: JsonRequired] bool SkipNextDurationTick, [property: JsonRequired] PowerDynamicVarSet? DynamicVars,
         [property: JsonRequired] string? ResolvedBigIconPath,
         [property: JsonRequired] IReadOnlyDictionary<string, object?> SavedProperties);
     [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
@@ -208,14 +208,13 @@ public sealed partial class PersistentNativeCombatEnvironment
                     else
                     {
                         ValidateHistoricalModelAbi(value, kind, path);
-                        object? powerVars = ReflectionTools.Get(value, "_dynamicVars");
-                        if (ReflectionTools.Get(value, "_internalData") is not null || powerVars is not null && ReflectionTools.Enumerate(powerVars).Count != 0)
-                            throw HistoryReferenceError(path, "Historical Power private data/nonempty variables require a separate codec.");
+                        if (ReflectionTools.Get(value, "_internalData") is not null)
+                            throw HistoryReferenceError(path, "Historical Power private data requires a separate codec.");
                         historicalPower = new(Reference(owner, "Creature", path + ".Owner"),
                             Reference(ReflectionTools.Get(value, "Applier"), "Creature", path + ".Applier"),
                             Reference(ReflectionTools.Get(value, "Target"), "Creature", path + ".Target"),
                             (int)ReflectionTools.Get(value, "Amount")!, (int)ReflectionTools.Get(value, "AmountOnTurnStart")!,
-                            (bool)ReflectionTools.Get(value, "SkipNextDurationTick")!, powerVars is not null,
+                            (bool)ReflectionTools.Get(value, "SkipNextDurationTick")!, CapturePowerDynamicVars(value, path + ".DynamicVars"),
                             (string?)ReflectionTools.Get(value, "_resolvedBigIconPath"), SavedNativeState(value));
                     }
                     break;
@@ -495,7 +494,9 @@ public sealed partial class PersistentNativeCombatEnvironment
         if (kind == "Power" && (Entry(model), model.GetType().FullName) is not
             (("DUPLICATION_POWER", "MegaCrit.Sts2.Core.Models.Powers.DuplicationPower")
             or ("MINION_POWER", "MegaCrit.Sts2.Core.Models.Powers.MinionPower")
-            or ("STRENGTH_POWER", "MegaCrit.Sts2.Core.Models.Powers.StrengthPower")))
+            or ("STRENGTH_POWER", "MegaCrit.Sts2.Core.Models.Powers.StrengthPower")
+            or ("WEAK_POWER", "MegaCrit.Sts2.Core.Models.Powers.WeakPower")
+            or ("VULNERABLE_POWER", "MegaCrit.Sts2.Core.Models.Powers.VulnerablePower")))
             throw HistoryReferenceError(path, $"Power {Entry(model)} has no reviewed historical carrier.");
         Type root = T("MegaCrit.Sts2.Core.Models." + kind + "Model");
         string[] owned = kind == "Potion" ? ["_owner", "_dynamicVars", "_canonicalInstance", "<IsQueued>k__BackingField", "<HasBeenRemovedFromState>k__BackingField", "BeforeUse"]
@@ -505,11 +506,11 @@ public sealed partial class PersistentNativeCombatEnvironment
             if (!owned.Contains(field.Name, StringComparer.Ordinal))
                 throw HistoryReferenceError(path, $"Unclassified {kind} base member {field.Name}.");
         // These families have bounded native value carriers, not an object-graph codec.
-        // Extra concrete mutable storage requires its own reviewed codec, even if default-valued.
+        // Extra concrete storage, including readonly containers, requires a reviewed carrier.
         for (Type? type = model.GetType(); type is not null && type != root; type = type.BaseType)
             foreach (FieldInfo field in type.GetFields(BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
                 if (!field.IsLiteral)
-                    throw HistoryReferenceError(path + "." + field.Name, "Concrete model storage is outside the historical Potion/Affliction codec.");
+                    throw HistoryReferenceError(path + "." + field.Name, $"Concrete model storage is outside the historical {kind} carrier.");
     }
 
     private object MutableHistoricalModel(HistoryObject o) => o.Kind == "Power"
@@ -555,6 +556,7 @@ public sealed partial class PersistentNativeCombatEnvironment
                 throw new ProtocolException("invalid_history_reference", "Resident Power Applier/Target is absent from the saved Creatures.");
             object model = ReflectionTools.Invoke(Find(ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Models.ModelDb"), "AllPowers")!, power.ModelId), "ToMutable", 0)!;
             ValidateHistoricalModelAbi(model, "Power", "Resident.Power");
+            ValidatePowerDynamicVars(power.ModelId, runtime.DynamicVars, "Resident.Power.DynamicVars");
         }
         List<PowerSnapshot>? Powers(uint id) => id == playerId ? snapshot.PlayerPowers
             : snapshot.OstyEntity?.Entity is { } pet && pet.CombatId == id ? pet.Powers
@@ -707,8 +709,9 @@ public sealed partial class PersistentNativeCombatEnvironment
                         Ref(JsonSerializer.SerializeToElement(power.Target), "Creature", true, path + ".Power.Target");
                         if (power.SavedProperties is null) throw new ProtocolException("invalid_combat_history", path);
                         ApplyNativeProperties(model, power.SavedProperties);
-                        if (ReflectionTools.Get(model, "_internalData") is not null || ReflectionTools.Enumerate(ReflectionTools.Get(model, "DynamicVars")).Count != 0)
-                            throw HistoryReferenceError(path + ".Power", "Private data/nonempty variables require a separate codec.");
+                        if (ReflectionTools.Get(model, "_internalData") is not null)
+                            throw HistoryReferenceError(path + ".Power", "Private data requires a separate codec.");
+                        ValidatePowerDynamicVars(o.ModelId!, power.DynamicVars, path + ".Power.DynamicVars");
                     }
                     continue;
                 }
@@ -929,8 +932,7 @@ public sealed partial class PersistentNativeCombatEnvironment
                 ReflectionTools.Set(model, "_amountOnTurnStart", power.AmountOnTurnStart);
                 ReflectionTools.Set(model, "_skipNextDurationTick", power.SkipNextDurationTick);
                 ReflectionTools.Set(model, "_resolvedBigIconPath", power.ResolvedBigIconPath);
-                if (power.DynamicVarsInitialized) _ = ReflectionTools.Get(model, "DynamicVars");
-                else ReflectionTools.Set(model, "_dynamicVars", null);
+                RestorePowerDynamicVars(model, power.DynamicVars, "History.Power.DynamicVars");
                 objects[i] = model;
             }
         }

@@ -419,6 +419,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             throw new ProtocolException("combat_root_osty_entity_mismatch", "Imported Osty entity fingerprint differs.");
         if (!CombatHistoryFingerprintMatches(snapshot, actual))
             throw new ProtocolException("combat_root_history_mismatch", "Imported shared history fingerprint differs.");
+        if (!PlayerPowerRuntimeFingerprintMatches(snapshot, actual))
+            throw new ProtocolException("combat_root_power_mismatch", "Imported reviewed player Power runtime differs.");
         timer.Stop();
         return imported with { Transition = new { kind = "portable_combat_root_import", replayed_actions = 0, elapsed_ms = timer.Elapsed.TotalMilliseconds } };
     }
@@ -4778,8 +4780,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 ReflectionTools.Set(power, "_amountOnTurnStart", runtime.AmountOnTurnStart);
                 ReflectionTools.Set(power, "_skipNextDurationTick", runtime.SkipNextDurationTick);
                 ReflectionTools.Set(power, "_resolvedBigIconPath", runtime.ResolvedBigIconPath);
-                if (runtime.DynamicVarsInitialized) _ = ReflectionTools.Get(power, "DynamicVars");
-                else ReflectionTools.Set(power, "_dynamicVars", null);
+                RestorePowerDynamicVars(power, runtime.DynamicVars, "Resident.Power.DynamicVars");
             }
             if (ps.BoundCardPlayed is bool played) ReflectionTools.Set(BoundPowerData(power), "boundCardPlayed", played);
             powersList.Add(power);
@@ -4811,14 +4812,13 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             throw new ProtocolException("unsupported_power_runtime", "ChainsOfBindingPower requires its exact bound-card state; other models cannot carry it.");
     }
 
-    private static bool HasReviewedPowerRuntime(string modelId) => modelId is "DUPLICATION_POWER" or "MINION_POWER" or "STRENGTH_POWER";
+    private static bool HasReviewedPowerRuntime(string modelId) => modelId is "DUPLICATION_POWER" or "MINION_POWER" or "STRENGTH_POWER" or "WEAK_POWER" or "VULNERABLE_POWER";
 
     private ResidentPowerRuntime CaptureResidentPowerRuntime(object power)
     {
         ValidateHistoricalModelAbi(power, "Power", "Resident.Power");
-        object? vars = ReflectionTools.Get(power, "_dynamicVars");
-        if (ReflectionTools.Get(power, "_internalData") is not null || vars is not null && ReflectionTools.Enumerate(vars).Count != 0)
-            throw new ProtocolException("unsupported_power_runtime", "Reviewed resident Power has unknown private data/nonempty variables.");
+        if (ReflectionTools.Get(power, "_internalData") is not null)
+            throw new ProtocolException("unsupported_power_runtime", "Reviewed resident Power has unknown private data.");
         uint? Id(object? creature)
         {
             if (creature is null) return null;
@@ -4828,7 +4828,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         }
         return new(Id(ReflectionTools.Get(power, "Applier")), Id(ReflectionTools.Get(power, "Target")),
             (int)ReflectionTools.Get(power, "AmountOnTurnStart")!, (bool)ReflectionTools.Get(power, "SkipNextDurationTick")!,
-            vars is not null, (string?)ReflectionTools.Get(power, "_resolvedBigIconPath"));
+            CapturePowerDynamicVars(power, "Resident.Power.DynamicVars"), (string?)ReflectionTools.Get(power, "_resolvedBigIconPath"));
     }
 
     private void RestoreResidentPowerReferences(CombatSnapshot snapshot)
@@ -4947,7 +4947,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         [property: System.Text.Json.Serialization.JsonRequired] uint? TargetCombatId,
         [property: System.Text.Json.Serialization.JsonRequired] int AmountOnTurnStart,
         [property: System.Text.Json.Serialization.JsonRequired] bool SkipNextDurationTick,
-        [property: System.Text.Json.Serialization.JsonRequired] bool DynamicVarsInitialized,
+        [property: System.Text.Json.Serialization.JsonRequired] PowerDynamicVarSet? DynamicVars,
         [property: System.Text.Json.Serialization.JsonRequired] string? ResolvedBigIconPath);
 
 
@@ -5015,7 +5015,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         return actual is not null && JsonSerializer.Serialize(expected.Enemies, PortableRootJson)
             == JsonSerializer.Serialize(actual.Enemies, PortableRootJson)
             && OstyEntityFingerprintMatches(expected, actual)
-            && CombatHistoryFingerprintMatches(expected, actual);
+            && CombatHistoryFingerprintMatches(expected, actual)
+            && PlayerPowerRuntimeFingerprintMatches(expected, actual);
     }
 
     private List<MonsterRuntimeEntry> CaptureMonsterRuntimeState(object monster)

@@ -1,12 +1,12 @@
-# Shared combat history v3
+# Shared combat history v4
 
 Pinned native DLL SHA256: `A1F9E653F1E28E4076558FEE1E60D218619CB7E057B887C6417F62C62C6D7A52`
 (game v0.107.1). Native source/ABI facts below were reviewed against this DLL.
 
-Portable combat roots require schema **4** and an explicit `combat_history` version **3**,
+Portable combat roots require schema **5** and an explicit `combat_history` version **4**,
 including empty history and source player combat/net IDs. Older roots/history fail closed.
 Observation, model-input, pending-wrapper and Osty entity contract versions are unchanged.
-Runtime capability is `decision-local-native-v9:pending-choice-regeneration:shared-combat-history-v3`.
+Runtime capability is `decision-local-native-v10:pending-choice-regeneration:shared-combat-history-v4`.
 
 The existing ordered 17 native entry types retain their Actor, round, side and player-turn
 dictionary. A shared reference table preserves CardPlay/DamageResult aliases, exact native
@@ -57,14 +57,32 @@ Missing snapshot-created owners are not mistaken for invalid previous-battle bin
 
 ## Historical powers and existing carriers
 
-Reviewed exact removed Power types are `DuplicationPower`, `MinionPower` and `StrengthPower`.
-All three concrete classes have no instance storage beyond the explicitly checked base ABI.
+Reviewed exact removed Power types are `DuplicationPower`, `MinionPower`, `StrengthPower`,
+`WeakPower` and `VulnerablePower`. All five concrete classes have no instance storage beyond
+the explicitly checked base ABI.
 Their shared carrier preserves actual Owner/Applier/Target aliases, Amount, AmountOnTurnStart,
-duration flag, null/empty variable-cache state, icon cache and SavedNativeState. Nonempty
-DynamicVars or private internal data fail closed. Native ToMutable(0) allocation followed by
+duration flag, actual variable-cache state, icon cache and SavedNativeState. Private internal
+data or unreviewed concrete storage still fail closed. Native ToMutable(0) allocation followed by
 direct hydration leaves these objects detached; retained corpse powers only populate the
 corpse's private list. The same reviewed runtime fields and live Applier/Target IDs are saved
 for resident instances, preserving later corpse capture after a prior alive-branch restore.
+
+HistoricalPower and ResidentPowerRuntime use the same bounded DynamicVar descriptor,
+validation, capture and restoration in PowerDynamicVarSnapshot.cs. Only the exact native
+DynamicVarSet and constant base DynamicVar type are supported. The readonly `_vars`
+dictionary is inspected and its ordered entries saved; unknown container/variable subclasses,
+extra instance fields or delegate-bearing variables are rejected. Weak's reviewed variable
+name is DamageDecrease; Vulnerable's is DamageIncrease; the other three reviewed powers
+have empty variables. Actual uninitialized null and initialized empty sets remain distinct.
+
+Each actual variable saves native type/name, own-Power or null owner alias, `_baseValue`,
+`_enchantedValue`, `_previewValue` and WasJustUpgraded. The three decimal values use exact
+invariant decimal strings, avoiding binary-float rounding in Python JSON transport. Native
+constant-variable construction is followed by direct member hydration from the saved values;
+canonical 0.75/1.5 defaults are not used as a substitute. No SetOwner virtual call, preview
+hooks, delegate invocation or RNG replay is needed. Extra/foreign owner aliases fail closed.
+Enemy/Osty fingerprints already include the complete PowerSnapshot lists; reviewed player
+Power runtime is now explicitly compared on portable import and resident/fallback restore.
 
 History-only consumed Potion and cleared Affliction carriers retain exact model/type,
 Owner/Card references and reviewed flags/native saved state. They do not refill potion slots
@@ -82,14 +100,28 @@ cleanup rebuilds its native base and directly applies its snapshot with zero act
 
 The original registered-immediate regression remains unchanged in
 `tests/test_fr1b2_generic_native.py` (the requested old filename is absent from this checkout).
-Its Queen component now survives `play:bludgeon-1:target:1`: Creature 1 Torch Head Amalgam
+Its Queen component survives `play:bludgeon-1:target:1`: Creature 1 Torch Head Amalgam
 dies from 15/199 HP while Queen stays active at 400 HP, and both original native branch
-assertions run. The same test subsequently fails in its Waterfall Giant component at
-`History.Entries[19].Power`, `WEAK_POWER`. Native `WeakPower` has no concrete instance fields,
-but its nonempty `_dynamicVars["DamageDecrease"]` holds a standard DynamicVar with
-BaseValue 0.75m. Native AfterSideTurnEnd -> PowerCmd.TickDownDuration removes it, leaving a
-historical Power reference. No reviewed nonempty DynamicVar carrier is implemented here.
-That exact path remains `unsupported_history_reference`; the full regression is not green.
+assertions run. The complete same test now also passes its Waterfall Giant component through
+the native RegisteredImmediate result ABOUT_TO_BLOW_MOVE and unchanged-root assertion.
+The previously blocking `History.Entries[19].Power` WEAK_POWER expiry path retains its actual
+DamageDecrease variable after native AfterSideTurnEnd -> PowerCmd.TickDownDuration removal.
+
+The new Bash witness executes the real card for 8 damage and applies Vulnerable amount 2,
+then imports cross-worker and executes Strike for 9 damage. Two actual enemy turns remove
+Vulnerable; its history-only object retains amount 0, the same constant-variable payload,
+Owner/Applier aliases and historical PowerReceivedEntry identity. A portable import after
+expiry continues with a real Strike for 6 damage. History has **6 -> 28 -> 33** entries after
+Bash, expiry and continuation. Restoring the pre-expiry branch has zero action replay and
+exact Power runtime/history; replaying the same real actions yields identical expiry history.
+One unknown variable-type descriptor on the same worker rejects before reset.
+
+A controlled decimal branch changes the saved multiplier to
+`1.234567890123456789012345678`, with distinct 1.25 enchanted and 1.375 preview values and
+an upgrade flag. Its stale public hash is correctly rejected. Re-exporting the resulting actual
+native state produces a valid native root; cross-worker import retains the exact strings and
+real Strike deals 7 damage. This witnesses actual captured state winning over canonical
+defaults and display previews; it does not claim a naturally occurring game modifier.
 
 The additional bounded Queen witness imports the post-kill root into another worker whose
 previous battle is at ascension 10, preserves the full shared history, then executes a real
@@ -111,7 +143,7 @@ Osty entity/input contracts, and STUNNED/REVIVE. Prepared pending native accepta
 GodotHost Debug builds have zero warnings/errors; Agent Ruff and both diffchecks pass.
 Divine's unchanged Python Ruff baseline has 660 violations; this C# repair does not alter it.
 The public-tree script's Protocol/Core Release builds also pass without warnings, but its
-source scan rejects the existing F:\SteamLibrary defaults in Directory.Build.props and
+source scan rejects the existing machine-specific Steam defaults in Directory.Build.props and
 TraceExporterSmoke.csproj. Those baseline configuration files are unchanged; no game binaries
 or generated native-source review files are included in this change.
 
