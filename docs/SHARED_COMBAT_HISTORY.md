@@ -5,13 +5,15 @@ Native DLL SHA256: `A1F9E653F1E28E4076558FEE1E60D218619CB7E057B887C6417F62C62C6D
 headless profile without loaded external mods. It is a history consumption
 contract, not arbitrary native private-object cloning.
 
-Portable combat schema **7** requires explicit history **5**, including empty
+Portable combat schema **8** requires explicit history **5**, including empty
 history, original player IDs and
 `consumer_contract = pinned-singleplayer-history-read-v1:<DLL SHA256>`.
 Older schemas, versions and consumption contracts reject before target reset.
 The implementation additionally checks the actual DLL hash. Observation/model
 input, pending wrapper and Osty entity schemas are unchanged. Agent capability
-is `decision-local-native-v12:pending-choice-regeneration:shared-combat-history-v5:resident-power-references-v1`.
+is `decision-local-native-v13:pending-choice-regeneration:shared-combat-history-v5:resident-power-references-v1:card-dynamic-runtime-v1:retired-combat-cards-v1`.
+Schema 8 composes common Power references, [card dynamic runtime v1](CARD_DYNAMIC_RUNTIME.md) and retired combat cards; the history
+consumer contract remains unchanged.
 
 ## Two different restoration responsibilities
 

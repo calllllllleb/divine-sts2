@@ -102,6 +102,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         combat_root_schema_version = ProtocolConstants.CombatRootSchemaVersion,
         combat_history_contract_version = CombatHistoryContractVersion,
         combat_history_consumer_contract = HistoryConsumerContract,
+        card_dynamic_runtime_version = CardDynamicRuntimeVersion,
         game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
         methods = new[] { "hello", "catalog", "reset", "run_reset", "map_reset", "reward_reset", "item_reward_reset", "custom_reward_reset", "rest_reset", "event_reset", "observe", "run_observe", "map_observe", "reward_observe", "custom_reward_observe", "rest_observe", "event_observe", "legal_actions", "step", "run_step", "map_step", "reward_step", "custom_reward_step", "rest_step", "event_step", "fork", "restore", "export_run_root", "export_run_mechanical_root", "compose_run_root", "compose_run_root_reference", "export_run_combat_root", "export_combat_root", "import_combat_root", "resample_draw_order", "fork_future_rng", "describe_monster_move_candidates", "describe_monster_move_rules", "describe_monster_roll_events", "describe_monster_transient_events", "describe_monster_immediate_rule", "describe_monster_roll_rules", "reconstruct_monster_moves", "describe_monster_rng_provenance", "diagnostics", "close" },
         supported_subset = new { characters = "native CharacterModel entries", encounters = "native EncounterModel entries", cards = "base/upgraded cards plus asynchronous native card, bundle, and relic choices", actions = new[] { "play_card", "use_potion", "discard_potion", "end_turn", "choose_cards", "choose_option", "choose_map", "choose_reward", "choose_rest", "choose_event", "open_treasure", "choose_treasure", "buy_shop", "choose_custom_reward", "skip_custom_rewards", "advance_act" }, potions = true, map = "native deterministic routing graph with composed combat, rest, event, treasure, shop, and inter-act transitions", events = "native model initialization, option continuations, nested event-created combats, blocking custom/linked rewards, and the final victory event" }
@@ -408,6 +409,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         catch (JsonException ex) { throw new ProtocolException("invalid_combat_history", "Invalid combat snapshot/history JSON: " + ex.Message); }
         ValidateOstyEntityDescriptor(snapshot);
         ValidateCombatHistory(snapshot);
+        ValidateCardDynamicRuntimes(snapshot);
         foreach (EnemySnapshot enemy in snapshot.Enemies)
             if (enemy.MonsterRuntimeState is null)
                 throw new ProtocolException("unsupported_combat_root", "Missing exact monster runtime payload.");
@@ -436,6 +438,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             throw new ProtocolException("combat_root_history_mismatch", "Imported shared history fingerprint differs.");
         if (!PlayerPowerRuntimeFingerprintMatches(snapshot, actual))
             throw new ProtocolException("combat_root_power_mismatch", "Imported player Power references/runtime fingerprint differs.");
+        if (!CardDynamicRuntimeFingerprintMatches(snapshot, actual))
+            throw new ProtocolException("combat_root_card_dynamic_mismatch", "Imported card dynamic runtime fingerprint differs.");
         timer.Stop();
         return imported with { Transition = new { kind = "portable_combat_root_import", replayed_actions = 0, elapsed_ms = timer.Elapsed.TotalMilliseconds } };
     }
@@ -1790,6 +1794,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
 
     private object CardVisiblePreview(object card, object? target)
     {
+        Action restoreScratch = PreserveCardVarPreview(card);
         object dynamicVars = ReflectionTools.Get(card, "DynamicVars")
             ?? throw new MissingMemberException(card.GetType().FullName, "DynamicVars");
         object previewMode = Enum.Parse(T("MegaCrit.Sts2.Core.Entities.Cards.CardPreviewMode"), "Normal");
@@ -1815,7 +1820,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         }
         finally
         {
-            ReflectionTools.Invoke(dynamicVars, "ClearPreview");
+            restoreScratch();
         }
     }
 
@@ -3964,6 +3969,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     private string GetOrAddCurrentBranch()
     {
         EnsureReset();
+        string? cardDynamicFingerprint = CurrentCardDynamicRuntimeFingerprint();
 
         // Passive-observe idempotency fast path: if no action edge is pending
         // (_lastActionId == null) and the worker already has a branch handle that
@@ -3973,7 +3979,9 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         // unchanged worker leave branch_count strictly at 1.
         if (_lastActionId is null && _currentBranchHandle is not null &&
             _branches.TryGetValue(_currentBranchHandle, out Branch? resident) &&
-            StringComparer.Ordinal.Equals(resident.ExpectedHash, _hash))
+            StringComparer.Ordinal.Equals(resident.ExpectedHash, _hash)
+            && (resident.MechanicsSnapshot is null
+                || cardDynamicFingerprint == CardDynamicRuntimeFingerprint(resident.MechanicsSnapshot)))
         {
             _branchOrder.Remove(_currentBranchHandle);
             _branchOrder.AddLast(_currentBranchHandle);
@@ -3986,7 +3994,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             action_id = _lastActionId,
             expected_hash = _hash,
             reset = _reset,
-            kernel = TransitionKernelSnapshot()
+            kernel = TransitionKernelSnapshot(),
+            card_dynamic_runtime = cardDynamicFingerprint
         });
         string id = "s:" + Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(payload)));
         // Fast path: if the current branch handle already maps to exactly this
@@ -4264,6 +4273,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                         enchModel,
                         enchAmount,
                         savedProps,
+                        CaptureCardDynamicRuntime(card, "Card." + instanceId),
                         affliction is null ? null : Entry(affliction),
                         affliction is null ? 0 : Convert.ToInt32(ReflectionTools.Get(affliction, "Amount")),
                         affliction is null ? null : SavedNativeState(affliction)
@@ -4433,6 +4443,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 CaptureCombatHistory()
             );
             ValidateCombatHistory(captured);
+            ValidateCardDynamicRuntimes(captured);
             return captured;
         }
         catch (ProtocolException) { throw; }
@@ -4452,6 +4463,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         {
             object? residentOsty = ValidateOstyEntityBinding(snap);
             ValidateCombatHistory(snap);
+            ValidateCardDynamicRuntimes(snap);
             // XuShuxi: Reject ambiguous bindings before mutating any native state.
             CardSnapshot[] residentCards = snap.Hand.Concat(snap.DrawPile).Concat(snap.DiscardPile)
                 .Concat(snap.ExhaustPile).Concat(snap.PlayPile).ToArray();
@@ -4541,6 +4553,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                         ReflectionTools.Invoke(nativeCard, "AfflictInternal", affliction, (decimal)cs.AfflictionAmount);
                     }
                     int curUpgrades = Convert.ToInt32(ReflectionTools.Get(nativeCard, "CurrentUpgradeLevel"));
+                    if (curUpgrades > cs.Upgrades)
+                        throw new ProtocolException("unsupported_card_upgrade_rollback", $"{cs.InstanceId}: cached upgrade rollback is outside the dynamic runtime codec.");
                     for (int u = curUpgrades; u < cs.Upgrades; u++)
                     {
                         ReflectionTools.Invoke(nativeCard, "UpgradeInternal");
@@ -4552,6 +4566,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
 
                     object costObj = ReflectionTools.Get(nativeCard, "EnergyCost")!;
                     ReflectionTools.Set(costObj, "_base", cs.BaseEnergyCost);
+
+                    RestoreCardDynamicRuntime(nativeCard, cs, "Card." + cs.InstanceId);
 
                     ReflectionTools.Invoke(pile, "AddInternal", nativeCard, -1, true);
                     _cardInstanceIds[nativeCard] = cs.InstanceId;
@@ -4920,6 +4936,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         string? EnchantmentModelId,
         decimal EnchantmentAmount,
         IReadOnlyDictionary<string, object?> SavedProperties,
+        [property: System.Text.Json.Serialization.JsonRequired] CardDynamicRuntime DynamicRuntime,
         string? AfflictionModelId = null,
         int AfflictionAmount = 0,
         IReadOnlyDictionary<string, object?>? AfflictionSavedProperties = null);
@@ -5006,7 +5023,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             == JsonSerializer.Serialize(actual.Enemies, PortableRootJson)
             && OstyEntityFingerprintMatches(expected, actual)
             && CombatHistoryFingerprintMatches(expected, actual)
-            && PlayerPowerRuntimeFingerprintMatches(expected, actual);
+            && PlayerPowerRuntimeFingerprintMatches(expected, actual)
+            && CardDynamicRuntimeFingerprintMatches(expected, actual);
     }
 
     private List<MonsterRuntimeEntry> CaptureMonsterRuntimeState(object monster)
