@@ -3180,8 +3180,25 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     {
         object? monster = ReflectionTools.Get(c, "Monster"), move = monster is null ? null : ReflectionTools.Get(monster, "NextMove");
         object[] intents = move is null ? [] : ReflectionTools.Enumerate(ReflectionTools.Get(move, "Intents")).Where(x => x is not null).Select(x => Intent(x!, c)).ToArray();
-        return new { combat_id = ReflectionTools.Get(c, "CombatId"), model_id = ReflectionTools.Get(ReflectionTools.Get(c, "ModelId")!, "Entry"), side = ReflectionTools.Get(c, "Side")!.ToString(), hp = ReflectionTools.Get(c, "CurrentHp"), max_hp = ReflectionTools.Get(c, "MaxHp"), block = ReflectionTools.Get(c, "Block"), alive = ReflectionTools.Get(c, "IsAlive"), next_move = move is null ? null : new { id = ReflectionTools.Get(move, "Id"), intents }, powers = ReflectionTools.Enumerate(ReflectionTools.Get(c, "Powers")).Where(x => x is not null).Select(x => PowerObservationSnapshot(x!)).ToArray() };
+        return new { combat_id = ReflectionTools.Get(c, "CombatId"), model_id = ReflectionTools.Get(ReflectionTools.Get(c, "ModelId")!, "Entry"), side = ReflectionTools.Get(c, "Side")!.ToString(), hp = ReflectionTools.Get(c, "CurrentHp"), max_hp = ReflectionTools.Get(c, "MaxHp"), block = ReflectionTools.Get(c, "Block"), alive = ReflectionTools.Get(c, "IsAlive"), attacks_this_turn = PublicAttacksThisTurn(c), next_move = move is null ? null : new { id = ReflectionTools.Get(move, "Id"), intents }, powers = ReflectionTools.Enumerate(ReflectionTools.Get(c, "Powers")).Where(x => x is not null).Select(x => PowerObservationSnapshot(x!)).ToArray() };
     }
+    private int? PublicAttacksThisTurn(object creature)
+    {
+        // Only the local player's Osty has a verified public count (Rattle's
+        // CalculatedHits minus one). Use the shipped history/turn predicate:
+        // one CreatureAttackedEntry is one attack, regardless of hit count.
+        if (_player is null || !ReferenceEquals(ReflectionTools.Get(_player, "Osty"), creature)) return null;
+        object history = ReflectionTools.Get(_manager!, "History")
+            ?? throw new MissingMemberException(_manager!.GetType().FullName, "History");
+        object entries = ReflectionTools.Get(history, "Entries")
+            ?? throw new MissingMemberException(history.GetType().FullName, "Entries");
+        Type attackedEntry = T("MegaCrit.Sts2.Core.Combat.History.Entries.CreatureAttackedEntry");
+        return ReflectionTools.Enumerate(entries).Count(entry => entry is not null
+            && attackedEntry.IsInstanceOfType(entry)
+            && ReferenceEquals(ReflectionTools.Get(entry, "Actor"), creature)
+            && ReflectionTools.Invoke(entry, "HappenedThisTurn", _combat) is true);
+    }
+
     private object PowerObservationSnapshot(object power)
     {
         string stackType = ReflectionTools.Get(power, "StackType")?.ToString()
