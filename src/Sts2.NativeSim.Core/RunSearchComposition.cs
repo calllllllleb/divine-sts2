@@ -105,7 +105,7 @@ public sealed partial class PersistentNativeCombatEnvironment
         };
     }
     private IEnumerable<(string Bag, string Model)> PublicObservedRunPulls()
-        => _runRelicOperations.Where(fact => fact.Operation is "front" or "back" && fact.ModelId is not null)
+        => _runRelicOperations.Where(fact => fact.Bag is "shared" or "player" && fact.Operation is "front" or "back" && fact.ModelId is not null)
             .Select(fact => (fact.Bag, fact.ModelId!)).Distinct();
     private readonly Dictionary<(int Act, int Index), (int Col, int Row)> _runRoomCoords = [];
     // XuShuxi: Sequential worlds cannot reuse factual reset/history branches.
@@ -227,7 +227,7 @@ public sealed partial class PersistentNativeCombatEnvironment
     {
         ThrowIfPoisoned(); EnsureReset();
         ValidateRunBoundary();
-        if (_reset!.RunContext is not null || _reset.Enemies is not null || _reset.InitialDrawPile is not null
+        if (_reset!.RunContext is not null || _reset.RngCounters is { Count: > 0 } || _reset.Enemies is not null || _reset.InitialDrawPile is not null
             || _reset.Deck.Any(card => card.NativeState is not null) || (_reset.Relics ?? []).Any(relic => relic.NativeState is not null)
             || (_reset.Potions ?? []).Any(potion => potion.NativeState is not null))
             throw new ProtocolException("unsupported_run_root_domain", "Unaudited reset-private domains cannot be copied into a Run world.");

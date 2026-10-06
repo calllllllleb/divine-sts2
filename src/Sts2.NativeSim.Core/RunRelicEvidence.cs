@@ -81,8 +81,9 @@ public sealed partial class PersistentNativeCombatEnvironment
     {
         if (ReferenceEquals(bag, ReflectionTools.Get(_run!, "SharedRelicGrabBag"))) return "shared";
         if (ReferenceEquals(bag, ReflectionTools.Get(_player!, "RelicGrabBag"))) return "player";
-        // XuShuxi: An unaudited third bag must never inherit player semantics.
-        throw new ProtocolException("run_relic_bag_owner_unsupported", "Only the native current player/shared bag owners are certified.");
+        // XuShuxi: Never guess player semantics or interrupt factual mechanics.
+        // The observer quarantines this operation; root export then fails closed.
+        return "unknown";
     }
 
     private static void CaptureRelicOperationBefore(object __instance, object[] __args, MethodBase __originalMethod,
@@ -96,7 +97,8 @@ public sealed partial class PersistentNativeCombatEnvironment
             .Select(method => method!.DeclaringType?.FullName ?? "").ToArray();
         string producer = callers.FirstOrDefault(name => name.StartsWith("MegaCrit.Sts2.Core.")
             && !name.Contains("RelicGrabBag") && !name.Contains("RelicFactory")) ?? "unknown";
-        string? reason = null;
+        string ownerBag = environment.PublicBagOwner(__instance);
+        string? reason = ownerBag == "unknown" ? "Unaudited third relic bag owner; only current player/shared composition is certified." : null;
         string rarity;
         if (environment._recordingShopRelics)
             rarity = environment._shopRelicSlot++ < 2 ? "roll" : "Shop";
@@ -134,7 +136,7 @@ public sealed partial class PersistentNativeCombatEnvironment
                 reason = $"Unaudited filter producer {owner}.{filter.Method.Name}; certified public filter context is required.";
         }
         __state = new(reason is null ? environment._runEvidenceOrdinal++ : --environment._uncertifiedRelicOrdinal, Convert.ToInt32(ReflectionTools.Get(environment._run!, "CurrentActIndex")),
-            Convert.ToInt32(ReflectionTools.Get(environment._run!, "TotalFloor")), environment.PublicBagOwner(__instance), producer,
+            Convert.ToInt32(ReflectionTools.Get(environment._run!, "TotalFloor")), ownerBag, producer,
             __originalMethod.Name == "PullFromFront" ? "front" : "back", reason is null ? rarity : null,
             reason is null ? filterKind : null, reason is null ? blacklist : [], null, null, reason);
     }
@@ -160,10 +162,12 @@ public sealed partial class PersistentNativeCombatEnvironment
             && environment._publicRelicAcquisitions.Contains(model);
         bool tutorial = frames.Any(frame => frame.GetMethod()?.Name == "TryGetRelicForTutorial"
             && frame.GetMethod()?.DeclaringType?.Name == "TreasureRoomRelicSynchronizer");
-        string? reason = factoryRemoval && environment._lastRelicPullOrdinal < 0 ? "Removal follows an uncertified relic producer." : null;
+        string ownerBag = environment.PublicBagOwner(__instance);
+        string? reason = ownerBag == "unknown" ? "Unaudited third relic bag owner; only current player/shared composition is certified."
+            : factoryRemoval && environment._lastRelicPullOrdinal < 0 ? "Removal follows an uncertified relic producer." : null;
         var fact = new RunRelicOperationFacts(reason is null ? environment._runEvidenceOrdinal++ : --environment._uncertifiedRelicOrdinal,
             Convert.ToInt32(ReflectionTools.Get(environment._run!, "CurrentActIndex")), Convert.ToInt32(ReflectionTools.Get(environment._run!, "TotalFloor")),
-            environment.PublicBagOwner(__instance), tutorial ? "treasure_tutorial_first_chest" : __originalMethod.Name,
+            ownerBag, tutorial ? "treasure_tutorial_first_chest" : __originalMethod.Name,
             __originalMethod.Name == "Remove" ? "remove" : "fallback",
             null, null, [], factoryRemoval ? environment._lastRelicPullOrdinal : null, publicObtain ? model : null, reason);
         environment._runRelicOperations.Add(fact);

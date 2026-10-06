@@ -59,6 +59,11 @@ pull identity stays null; only the sampled native world materializes it. Replay
 executes native filtering, refresh, rarity fallback and pull/remove behavior at
 that historical public context. The old unordered depletion is a derived view.
 Unknown filters/RNG-override producers reject with their named source reason.
+Unaudited third bag observations are quarantined for root export, without throwing
+inside factual mechanics or inventing a player bag owner. Revealed depletion in a
+known player/shared bag remains public even if its composition producer rejects.
+Factual reset-private overrides, including nonempty supplied RNG counters, reject
+at root export and are never transferred into initialization parameters.
 
 Maximum attempts per composition request: **8192**. Exhaustion returns
 `run_composition_attempts_exhausted` with domain, attempt count, first contradicted
