@@ -82,7 +82,8 @@ public sealed partial class PersistentNativeCombatEnvironment
         if (snapshot.OstyEntity is not { Version: OstyEntityContractVersion } payload)
             throw new ProtocolException("unsupported_osty_entity_contract", "Missing/version-mismatched entity payload; empty Osty requires an explicit payload.");
         if (snapshot.Enemies.Select(enemy => enemy.CombatId).Distinct().Count() != snapshot.Enemies.Count
-            || snapshot.Enemies.Any(enemy => enemy.CombatId >= snapshot.NextCreatureId))
+            || snapshot.Enemies.Any(enemy => enemy.CombatId >= snapshot.NextCreatureId
+                || !Enum.IsDefined(T("MegaCrit.Sts2.Core.Entities.Creatures.HpDisplay"), enemy.HpDisplay)))
             throw new ProtocolException("invalid_creature_identity", "Snapshot enemy IDs must be unique and below next-id.");
         if (payload.Entity is not { } saved) return;
         if (saved.ModelId != "OSTY" || saved.Side != "Player" || !saved.InAllies || !saved.InPets

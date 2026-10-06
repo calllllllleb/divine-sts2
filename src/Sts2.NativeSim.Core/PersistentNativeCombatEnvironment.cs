@@ -4268,7 +4268,9 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                     list.Add(new PowerSnapshot(
                         pId,
                         amount,
-                        saved
+                        saved,
+                        pId == "CHAINS_OF_BINDING_POWER" ? CaptureBoundCardPlayed(p) : null,
+                        HasReviewedPowerRuntime(pId) ? CaptureResidentPowerRuntime(p) : null
                     ));
                 }
                 return list;
@@ -4335,6 +4337,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                     monsterRngCounter,
                     monsterRngSeed,
                     nextMoveId,
+                    (int?)ReflectionTools.Get(enemy!, "MonsterMaxHpBeforeModification"),
+                    ReflectionTools.Get(enemy!, "HpDisplay")!.ToString()!,
                     monster is null ? null : CaptureMonsterRuntimeState(monster),
                     transientMove
                 ));
@@ -4416,7 +4420,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         catch (ProtocolException) { throw; }
         catch (Exception ex)
         {
-            _lastSnapshotDebug = $"capture_ex: {ex.Message}";
+            _lastSnapshotDebug = $"capture_ex: {ReflectionTools.Unwrap(ex)}";
             return null;
         }
         finally { _suppressMonsterMoveEvents = oldSuppression; }
@@ -4430,7 +4434,6 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         {
             object? residentOsty = ValidateOstyEntityBinding(snap);
             ValidateCombatHistory(snap);
-            ValidateCombatHistoryBindings(snap);
             // XuShuxi: Reject ambiguous bindings before mutating any native state.
             CardSnapshot[] residentCards = snap.Hand.Concat(snap.DrawPile).Concat(snap.DiscardPile)
                 .Concat(snap.ExhaustPile).Concat(snap.PlayPile).ToArray();
@@ -4645,6 +4648,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 ReflectionTools.Set(creature, "CurrentHp", es.CurrentHp);
                 ReflectionTools.Set(creature, "MaxHp", es.MaxHp);
                 ReflectionTools.Set(creature, "Block", es.Block);
+                ReflectionTools.Set(creature, "MonsterMaxHpBeforeModification", es.MonsterMaxHpBeforeModification);
+                ReflectionTools.Set(creature, "HpDisplay", Enum.Parse(T("MegaCrit.Sts2.Core.Entities.Creatures.HpDisplay"), es.HpDisplay));
                 RestoreCreaturePowers(creature, es.Powers);
 
                 object? monsterObj = ReflectionTools.Get(creature, "Monster");
@@ -4741,6 +4746,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             ReflectionTools.Set(_combat, "_nextCreatureId", snap.NextCreatureId);
             ReflectionTools.Set(_manager!, "_state", _combat);
             ReflectionTools.Set(_manager!, "IsInProgress", true);
+            RestoreResidentPowerReferences(snap);
+            ValidateCombatHistoryBindings(snap);
             RestoreCombatHistory(snap.CombatHistory!);
 
             return true;
@@ -4764,8 +4771,83 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             ReflectionTools.Set(power, "_amount", ps.Amount);
             ReflectionTools.Set(power, "_owner", creature);
             ApplyNativeProperties(power, ps.SavedProperties);
+            ValidateBoundPowerSnapshot(ps);
+            if (ps.Runtime is { } runtime)
+            {
+                ValidateHistoricalModelAbi(power, "Power", "Resident.Power");
+                ReflectionTools.Set(power, "_amountOnTurnStart", runtime.AmountOnTurnStart);
+                ReflectionTools.Set(power, "_skipNextDurationTick", runtime.SkipNextDurationTick);
+                ReflectionTools.Set(power, "_resolvedBigIconPath", runtime.ResolvedBigIconPath);
+                if (runtime.DynamicVarsInitialized) _ = ReflectionTools.Get(power, "DynamicVars");
+                else ReflectionTools.Set(power, "_dynamicVars", null);
+            }
+            if (ps.BoundCardPlayed is bool played) ReflectionTools.Set(BoundPowerData(power), "boundCardPlayed", played);
             powersList.Add(power);
         }
+    }
+
+    // Exact pinned live-power carrier. ChainsOfBinding uses this one private
+    // bool in ShouldPlay; replaying a later bound card must not poison an older branch.
+    private object BoundPowerData(object power)
+    {
+        if (power.GetType().FullName != "MegaCrit.Sts2.Core.Models.Powers.ChainsOfBindingPower")
+            throw new ProtocolException("unsupported_power_runtime", "ChainsOfBindingPower native type mismatch.");
+        ExactInstanceFields(power.GetType(), [], "ChainsOfBindingPower");
+        object data = ReflectionTools.Get(power, "_internalData")
+            ?? throw new ProtocolException("unsupported_power_runtime", "ChainsOfBindingPower._internalData is null.");
+        if (data.GetType().FullName != "MegaCrit.Sts2.Core.Models.Powers.ChainsOfBindingPower+Data")
+            throw new ProtocolException("unsupported_power_runtime", "Unknown ChainsOfBindingPower private data type.");
+        ExactInstanceFields(data.GetType(), ["boundCardPlayed"], "ChainsOfBindingPower.Data");
+        if (ReflectionTools.Get(data, "boundCardPlayed") is not bool)
+            throw new ProtocolException("unsupported_power_runtime", "ChainsOfBindingPower.Data.boundCardPlayed is not Boolean.");
+        return data;
+    }
+
+    private bool CaptureBoundCardPlayed(object power) => (bool)ReflectionTools.Get(BoundPowerData(power), "boundCardPlayed")!;
+
+    private static void ValidateBoundPowerSnapshot(PowerSnapshot power)
+    {
+        if ((power.ModelId == "CHAINS_OF_BINDING_POWER") != power.BoundCardPlayed.HasValue)
+            throw new ProtocolException("unsupported_power_runtime", "ChainsOfBindingPower requires its exact bound-card state; other models cannot carry it.");
+    }
+
+    private static bool HasReviewedPowerRuntime(string modelId) => modelId is "DUPLICATION_POWER" or "MINION_POWER" or "STRENGTH_POWER";
+
+    private ResidentPowerRuntime CaptureResidentPowerRuntime(object power)
+    {
+        ValidateHistoricalModelAbi(power, "Power", "Resident.Power");
+        object? vars = ReflectionTools.Get(power, "_dynamicVars");
+        if (ReflectionTools.Get(power, "_internalData") is not null || vars is not null && ReflectionTools.Enumerate(vars).Count != 0)
+            throw new ProtocolException("unsupported_power_runtime", "Reviewed resident Power has unknown private data/nonempty variables.");
+        uint? Id(object? creature)
+        {
+            if (creature is null) return null;
+            if (!ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Creatures")).Any(c => ReferenceEquals(c, creature)))
+                throw HistoryReferenceError("Resident.Power.Reference", $"Nonresident {creature.GetType().FullName} requires a separate live Power carrier.");
+            return CreatureIdentity(creature);
+        }
+        return new(Id(ReflectionTools.Get(power, "Applier")), Id(ReflectionTools.Get(power, "Target")),
+            (int)ReflectionTools.Get(power, "AmountOnTurnStart")!, (bool)ReflectionTools.Get(power, "SkipNextDurationTick")!,
+            vars is not null, (string?)ReflectionTools.Get(power, "_resolvedBigIconPath"));
+    }
+
+    private void RestoreResidentPowerReferences(CombatSnapshot snapshot)
+    {
+        object Creature(uint id) => ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Creatures"))
+            .Single(c => c is not null && CreatureIdentity(c) == id)!;
+        void Bind(object creature, List<PowerSnapshot> snapshots)
+        {
+            var powers = ReflectionTools.Enumerate(ReflectionTools.Get(creature, "Powers"));
+            for (int i = 0; i < snapshots.Count; i++)
+                if (snapshots[i].Runtime is { } runtime)
+                {
+                    ReflectionTools.Set(powers[i]!, "_applier", runtime.ApplierCombatId is uint a ? Creature(a) : null);
+                    ReflectionTools.Set(powers[i]!, "_target", runtime.TargetCombatId is uint t ? Creature(t) : null);
+                }
+        }
+        Bind(ReflectionTools.Get(_player!, "Creature")!, snapshot.PlayerPowers);
+        foreach (EnemySnapshot enemy in snapshot.Enemies) Bind(Creature(enemy.CombatId), enemy.Powers);
+        if (snapshot.OstyEntity?.Entity is { } osty) Bind(Creature(osty.CombatId), osty.Powers);
     }
 
     private static void ApplyNativeProperties(object model, IReadOnlyDictionary<string, object?>? props)
@@ -4855,7 +4937,18 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     private sealed record PowerSnapshot(
         string ModelId,
         int Amount,
-        IReadOnlyDictionary<string, object?> SavedProperties);
+        IReadOnlyDictionary<string, object?> SavedProperties,
+        [property: System.Text.Json.Serialization.JsonRequired] bool? BoundCardPlayed,
+        [property: System.Text.Json.Serialization.JsonRequired] ResidentPowerRuntime? Runtime);
+
+    [System.Text.Json.Serialization.JsonUnmappedMemberHandling(System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow)]
+    private sealed record ResidentPowerRuntime(
+        [property: System.Text.Json.Serialization.JsonRequired] uint? ApplierCombatId,
+        [property: System.Text.Json.Serialization.JsonRequired] uint? TargetCombatId,
+        [property: System.Text.Json.Serialization.JsonRequired] int AmountOnTurnStart,
+        [property: System.Text.Json.Serialization.JsonRequired] bool SkipNextDurationTick,
+        [property: System.Text.Json.Serialization.JsonRequired] bool DynamicVarsInitialized,
+        [property: System.Text.Json.Serialization.JsonRequired] string? ResolvedBigIconPath);
 
 
     // XuShuxi: Exact native capability only; never included in observation or public hash.
@@ -4997,6 +5090,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         int MonsterRngCounter,
         uint MonsterRngSeed,
         string? NextMoveId,
+        [property: System.Text.Json.Serialization.JsonRequired] int? MonsterMaxHpBeforeModification,
+        [property: System.Text.Json.Serialization.JsonRequired] string HpDisplay,
         List<MonsterRuntimeEntry>? MonsterRuntimeState = null,
         TransientMoveSnapshot? TransientMove = null);
 

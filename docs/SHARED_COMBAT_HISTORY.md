@@ -1,85 +1,122 @@
-# Shared combat history v2
+# Shared combat history v3
 
-Pinned native DLL SHA256: `A1F9E653F1E28E4076558FEE1E60D218619CB7E057B887C6417F62C62C6D7A52`.
-Source facts were reviewed against this same DLL; earlier acceptance revisions remain historical.
+Pinned native DLL SHA256: `A1F9E653F1E28E4076558FEE1E60D218619CB7E057B887C6417F62C62C6D7A52`
+(game v0.107.1). Native source/ABI facts below were reviewed against this DLL.
 
-Portable combat roots use schema **3**, from `ProtocolConstants.CombatRootSchemaVersion`.
-An explicit `combat_history` version **2** payload is required, including empty history and
-the source player combat/net IDs. Schema 1/2 roots, missing history and history contract 1
-fail closed. Pending wrapper, observation and model-input schema versions are unchanged.
-Runtime capability is `decision-local-native-v8:pending-choice-regeneration:shared-combat-history-v2`.
+Portable combat roots require schema **4** and an explicit `combat_history` version **3**,
+including empty history and source player combat/net IDs. Older roots/history fail closed.
+Observation, model-input, pending-wrapper and Osty entity contract versions are unchanged.
+Runtime capability is `decision-local-native-v9:pending-choice-regeneration:shared-combat-history-v3`.
 
-`CombatHistorySnapshot.cs` captures the ordered 17 pinned entry types with an explicit field
-whitelist. Each entry owns its saved Actor, round, side and player-turn dictionary. The local
-reference table preserves CardPlay and DamageResult aliases, resident Card/Creature identity,
-null targets, resources, result piles, auto-play and replay indices/counts. Finished.WasEthereal
-is restored from its stored boolean even when the card has changed since the original play.
-Internal reference numbers never become policy features or public hash inputs.
+The existing ordered 17 native entry types retain their Actor, round, side and player-turn
+dictionary. A shared reference table preserves CardPlay/DamageResult aliases, exact native
+type/model identity, nullable targets, resources, result piles and replay/auto-play values.
+Finished.WasEthereal remains its historical stored value. Internal object IDs are never policy
+features. The complete serialized payload participates in import and resident fingerprints.
 
-Capture rejects unknown entries and unsupported references. Import validates descriptors
-without reading the destination worker's previous battle. Native Move bindings are checked
-against the correct restoration base after reset, before snapshot mutation; transient Power
-dependencies use the snapshot's saved power models/properties. After card/entity restoration,
-native record constructors create a temporary ordered list; one assignment replaces
-History._entries without appending successors or firing Changed. No card, attack, summon,
-reward or RNG replay reconstructs history. Import and resident fast-path fingerprints include
-the payload in addition to the existing public hash, enemy and Osty checks.
+## Detached dead enemies
 
-Resident references bind to cards in the five existing combat piles, present player/enemy/Osty
-creatures, attached powers/afflictions, potion slots/orb queue, and unique native FSM MoveState
-instances. Historical STUNNED/REVIVE moves reuse the existing exact transient-move codec,
-including original follow-up and performed flags. Native Power/Orb/Affliction restoration
-reuses corresponding resident instances. CardPlay and DamageResult are non-effect native
-record objects with their complete pinned stored members.
+The reference table now has mutually exclusive resident and history-only Creature, Monster
+and Move forms. Supported dead Monster types are exactly native `TorchHeadAmalgam` and
+`Nibbit`; their FSM allocation factories and concrete fields have been reviewed. This is a
+bounded native carrier, not an arbitrary object serializer or general removed-monster claim.
 
-History-only Potion and Affliction payloads are separate from resident bindings and retain
-actual native type/model, nullable Owner/Card references, amount/native flags and existing
-SavedNativeState. Extra mutable concrete storage and nonempty potion variables fail closed.
-Consumed DUPLICATOR and cleared BOUND are verified real paths. Hydration uses native mutable
-models, then direct native members; it never refills potion slots or reattaches afflictions.
-Objects with the same model ID retain separate table entries and sharing follows actual aliases.
+Capture reads the actual objects after native death removal: Creature has HP 0, its original
+CombatId/side/slot/block/max HP/HP display, null CombatState/Player/PetOwner and its retained
+Power list. Its native Monster retains its reciprocal Creature, SavedNativeState, existing
+MonsterRuntimeState, original NextMove, actual null FSM, nonexecuting flag, nullable own RNG
+seed/counter and nullable shared run-RNG binding. Concrete readonly storage is checked too;
+unclassified fields reject with their native type/member path. Live enemy snapshots also
+retain MonsterMaxHpBeforeModification and HpDisplay so restoring and killing the earlier
+alive branch yields the same corpse payload.
 
-The only supported removed Power is the exact pinned `DuplicationPower`/`DUPLICATION_POWER`.
-Its concrete class has no extra instance fields. The payload saves its actual Owner/Applier/
-Target references, Amount, AmountOnTurnStart, duration flag, empty variable-cache state, icon
-cache and SavedNativeState. Private internal data/nonempty variables fail closed. Restore
-uses native canonical ToMutable(0), hydrates members and leaves the object outside live Powers;
-it never invokes ApplyInternal, SetAmount, removal or combat hooks. This is not general removed
-Power support.
+Move ownership comes from actual MonsterPerformedMoveEntry.Monster/Move associations, with
+Monster.NextMove as another validated association. Capture does not depend on the dead
+Monster's empty FSM. Each Move saves its original native behavior method identity, MoveId,
+follow-up, performed/must-perform flags and ordered native intents. Reviewed constant attack
+intent closures retain damage, repeat count, method identity and animation cache; the
+reviewed Buff/Defend intents have no additional storage. Other intent/delegate storage fails
+closed. No Move behavior or damage delegate is executed to reconstruct history.
 
-Terminal combat results do not require a future executable combat snapshot. Explicit portable
-export of a decided battle returns `unsupported_combat_root`. Restoring a previously captured
-active branch after terminal cleanup recreates its original native base without clearing
-branch handles, then applies its snapshot directly, with zero player-action replay.
+Restore first allocates all native models, then directly constructs detached native Creatures,
+hydrates scalar state/RNG and reciprocal references, and finally constructs ordered entries.
+Original Move instances come from the reviewed native allocation-only FSM factory, binding
+the real native methods on the reconstructed Monster. Its FSM property remains null and
+NextMove aliases the table's native Move. Construction never calls SetUpForCombat, RollMove,
+PerformMove, death, summon, entry, damage or Power application/removal hooks, and never
+advances future RNG. Detached instances are not added to Enemies/Creatures, StateTracker,
+live power collections or policy observations. One assignment replaces History._entries;
+it does not append a successor tail or fire Changed.
 
-Removed cards/creatures, dupes outside the card codec, other removed powers/orbs and historical
-moves outside the existing FSM/transient codec remain `unsupported_history_reference`, with
-the actual entry/member path. Extra Potion/Affliction native state outside the bounded carrier
-also fails closed. No simplified ghost or optional empty-history fallback is used. Active
-post-action automatic capture can reject those states. The unchanged Queen registered-immediate
-regression currently reaches `History.Entries[0].Actor` after `play:bludgeon-1:target:1`:
-Torch Head Amalgam (Creature 1) has been removed, while Queen (Creature 2, HP 400), player and
-native combat remain active. This remaining Creature boundary is not a terminal-capture issue.
+Descriptor validation checks versions, mutually exclusive forms, exact types/models, native
+Move/method/intent identities and all references before resetting the target. It uses metadata
+and saved state, without generating an FSM or reading the target's previous encounter or
+ascension. Resident binding validation runs after live entities and RNG are restored; detached
+Move semantics are checked against the real factory after the correct base is restored.
+Missing snapshot-created owners are not mistaken for invalid previous-battle bindings.
 
-An exploratory Bygone Effigy root exposed the existing SlowPower `display_amount` mismatch
-(10 on source, 0 after import), while shared history matched. Public-hash rejection remains;
-that independent power-runtime gap is not repaired.
+## Historical powers and existing carriers
 
-Native witnesses cover subsequent Rattle damage, one/multiple attacks, portable import,
-cross-branch restore without accumulated counts, turn reset, Finisher, real Spiral replay,
-and Apparition followed by Apotheosis. They also cover two consumed DUPLICATOR instances and
-two removed DuplicationPower instances followed by actual Rattle damage; cleared BOUND import
-followed by a real card; Move-history import after a different previous encounter; victory/
-loss with explicit export rejection and restoration of earlier active branches. Fail-closed
-boundary checks share one worker rather than adding one startup/test per record field.
-The original Osty model-input DUPLICATOR regression is unchanged and passes. The original
-Queen regression remains intact and exposes the active removed-Creature boundary above.
-No long training, merge or force-push is part of this batch.
+Reviewed exact removed Power types are `DuplicationPower`, `MinionPower` and `StrengthPower`.
+All three concrete classes have no instance storage beyond the explicitly checked base ABI.
+Their shared carrier preserves actual Owner/Applier/Target aliases, Amount, AmountOnTurnStart,
+duration flag, null/empty variable-cache state, icon cache and SavedNativeState. Nonempty
+DynamicVars or private internal data fail closed. Native ToMutable(0) allocation followed by
+direct hydration leaves these objects detached; retained corpse powers only populate the
+corpse's private list. The same reviewed runtime fields and live Applier/Target IDs are saved
+for resident instances, preserving later corpse capture after a prior alive-branch restore.
 
-Focused verification (2026-10-07, before committing this repair): GodotHost Debug build has
-zero warnings/errors. History/Osty/input/STUNNED/REVIVE group reports **34 passed, 1 deselected**
-in 118.47s; the deselected unchanged Queen test was run separately and fails at the exact
-active removed-Creature path above. Unchanged DUPLICATOR input passes. Enabled Prepared
-pending acceptance reports **1 passed** in 7.69s. Harness/checkpoint/pin focused checks report
-**20 passed** in 2.90s. Ruff and both repository diffchecks pass. This is a review candidate;
-the unchanged Queen failure remains open pending active historical-Creature support.
+History-only consumed Potion and cleared Affliction carriers retain exact model/type,
+Owner/Card references and reviewed flags/native saved state. They do not refill potion slots
+or reattach afflictions. Distinct instances of one model stay distinct; aliases stay shared.
+The live ChainsOfBindingPower carrier additionally preserves its exact private
+`Data.boundCardPlayed` boolean, needed to recover prior legal BOUND actions after a successor
+branch. Other private object graphs are not covered. Existing STUNNED/REVIVE transient Move
+restoration retains its original native follow-up and performed flags.
+
+Terminal combat still returns normally. Explicit export of a decided battle rejects with
+`unsupported_combat_root`. Restoring a previously captured active branch after terminal
+cleanup rebuilds its native base and directly applies its snapshot with zero action replay.
+
+## Real native witnesses and remaining limits
+
+The original registered-immediate regression remains unchanged in
+`tests/test_fr1b2_generic_native.py` (the requested old filename is absent from this checkout).
+Its Queen component now survives `play:bludgeon-1:target:1`: Creature 1 Torch Head Amalgam
+dies from 15/199 HP while Queen stays active at 400 HP, and both original native branch
+assertions run. The same test subsequently fails in its Waterfall Giant component at
+`History.Entries[19].Power`, `WEAK_POWER`. Native `WeakPower` has no concrete instance fields,
+but its nonempty `_dynamicVars["DamageDecrease"]` holds a standard DynamicVar with
+BaseValue 0.75m. Native AfterSideTurnEnd -> PowerCmd.TickDownDuration removes it, leaving a
+historical Power reference. No reviewed nonempty DynamicVar carrier is implemented here.
+That exact path remains `unsupported_history_reference`; the full regression is not green.
+
+The additional bounded Queen witness imports the post-kill root into another worker whose
+previous battle is at ascension 10, preserves the full shared history, then executes a real
+end turn and a real card for **24 damage** to Queen. Only enemy CombatId 2 remains. History
+has **153 -> 158 -> 176** entries before death, after death and after continuation. Restoring
+the earlier active branch recovers its exact 153-entry history with zero replay; repeating
+the kill reproduces the original 158-entry payload, including powers and native Move aliases.
+
+The ordinary `NIBBITS_NORMAL` two-enemy witness kills Creature 1 with the second Rattle
+(7 then **14 damage**), imports cross-worker, executes the third Rattle for **21 damage** to
+Creature 2 and ends the turn. Osty count is 3 then resets to 0. Creature 1 never returns to
+the live enemy set. History has **7 -> 13 -> 28** entries. Earlier alive-branch restoration
+is exact with zero replay/no tail; repeating the kill yields the identical 13-entry payload.
+
+Directly affected witnesses also cover Rattle cross-branch/next-turn behavior, Finisher,
+native replay aliases, two consumed DUPLICATOR/power instances, cleared BOUND followed by
+a real card, Move history after a different previous combat, terminal victory/loss restoration,
+Osty entity/input contracts, and STUNNED/REVIVE. Prepared pending native acceptance passed.
+GodotHost Debug builds have zero warnings/errors; Agent Ruff and both diffchecks pass.
+Divine's unchanged Python Ruff baseline has 660 violations; this C# repair does not alter it.
+The public-tree script's Protocol/Core Release builds also pass without warnings, but its
+source scan rejects the existing F:\SteamLibrary defaults in Directory.Build.props and
+TraceExporterSmoke.csproj. Those baseline configuration files are unchanged; no game binaries
+or generated native-source review files are included in this change.
+
+Removed cards, unsupported dead Monster types, other removed powers/orbs, and extra
+Potion/Affliction/intent storage still fail at their concrete history member path. Earlier
+Bygone Effigy evidence also exposed an independent resident SlowPower display_amount
+mismatch (source 10, imported 0); it is not repaired or recertified here. These limits prevent
+claiming a complete general training baseline. No long training, main merge or force push.
