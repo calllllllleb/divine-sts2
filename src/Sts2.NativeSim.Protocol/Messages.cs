@@ -7,6 +7,7 @@ public static class ProtocolConstants { public const int Version = 1; public con
 public sealed record RpcRequest([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("method")] string Method, [property: JsonPropertyName("params")] JsonElement Parameters);
 public sealed record RpcResponse([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("ok")] bool Ok, [property: JsonPropertyName("result")] object? Result = null, [property: JsonPropertyName("error")] ProtocolError? Error = null);
 public sealed record ProtocolError([property: JsonPropertyName("code")] string Code, [property: JsonPropertyName("message")] string Message, [property: JsonPropertyName("details")] object? Details = null);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record GameBuildSpec([property: JsonPropertyName("version")] string? Version = null, [property: JsonPropertyName("assembly_sha256")] string? AssemblySha256 = null, [property: JsonPropertyName("pck_sha256")] string? PckSha256 = null);
 public sealed record EnchantmentSpec([property: JsonPropertyName("model_id")] string ModelId, [property: JsonPropertyName("amount")] int Amount = 1);
 public sealed record CardSpec([property: JsonPropertyName("instance_id")] string InstanceId, [property: JsonPropertyName("model_id")] string ModelId, [property: JsonPropertyName("upgrades")] int Upgrades = 0, [property: JsonPropertyName("native_state")] IReadOnlyDictionary<string, JsonElement>? NativeState = null, [property: JsonPropertyName("enchantment")] EnchantmentSpec? Enchantment = null);
@@ -53,16 +54,107 @@ public sealed record StepRequest([property: JsonPropertyName("action_id")] strin
 // Search-private Run composition payload. Author: XuShuxi.
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record PortableRunRoot(
-    [property: JsonPropertyName("schema_version")] int SchemaVersion,
-    [property: JsonPropertyName("game_build")] GameBuildSpec GameBuild,
-    [property: JsonPropertyName("public_reset")] ResetRequest PublicReset,
-    [property: JsonPropertyName("public_map")] JsonElement PublicMap,
-    [property: JsonPropertyName("boss")] string Boss,
+    [property: JsonPropertyName("schema_version"), JsonRequired] int SchemaVersion,
+    [property: JsonPropertyName("game_build"), JsonRequired] GameBuildSpec GameBuild,
+    [property: JsonPropertyName("initialization"), JsonRequired] RunInitializationFacts Initialization,
+    [property: JsonPropertyName("current_player"), JsonRequired] RunPlayerFacts CurrentPlayer,
+    [property: JsonPropertyName("public_context"), JsonRequired] IReadOnlyDictionary<string, JsonElement> PublicContext,
+    [property: JsonPropertyName("public_relic_pulls"), JsonRequired] IReadOnlyList<string> PublicRelicPulls,
+    [property: JsonPropertyName("event_selections"), JsonRequired] IReadOnlyList<RunEventSelectionFacts> EventSelections,
+    [property: JsonPropertyName("relic_operations"), JsonRequired] IReadOnlyList<RunRelicOperationFacts> RelicOperations,
+    [property: JsonPropertyName("quest_markers"), JsonRequired] IReadOnlyList<RunQuestMarkerFacts> QuestMarkers,
+    [property: JsonPropertyName("visited_coords"), JsonRequired] IReadOnlyList<RunCoordinate> VisitedCoords,
+    [property: JsonPropertyName("history_coords"), JsonRequired] IReadOnlyList<RunHistoryCoordinate> HistoryCoords,
+    [property: JsonPropertyName("stage"), JsonRequired] string Stage,
+    [property: JsonPropertyName("treasure")] RunTreasureFacts? Treasure,
+    [property: JsonPropertyName("rest_selection")] string? RestSelection,
+    [property: JsonPropertyName("rewards"), JsonRequired] IReadOnlyList<RunRewardFacts> Rewards,
+    [property: JsonPropertyName("public_map"), JsonRequired] JsonElement PublicMap,
+    [property: JsonPropertyName("boss"), JsonRequired] string Boss,
     [property: JsonPropertyName("second_boss")] string? SecondBoss);
+// XuShuxi: Whitelisted public faces. These contracts deliberately cannot express
+// a native instance id, seed, counter set, saved property bag, queue, or handle.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunCardFace(
+    [property: JsonPropertyName("model_id"), JsonRequired] string ModelId,
+    [property: JsonPropertyName("upgrades"), JsonRequired] int Upgrades,
+    [property: JsonPropertyName("enchantment")] RunEnchantmentFace? Enchantment);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunEnchantmentFace(
+    [property: JsonPropertyName("model_id"), JsonRequired] string ModelId,
+    [property: JsonPropertyName("amount"), JsonRequired] int Amount);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunPlayerFacts(
+    [property: JsonPropertyName("current_hp"), JsonRequired] int CurrentHp,
+    [property: JsonPropertyName("max_hp"), JsonRequired] int MaxHp,
+    [property: JsonPropertyName("gold"), JsonRequired] int Gold,
+    [property: JsonPropertyName("block"), JsonRequired] int Block,
+    [property: JsonPropertyName("deck"), JsonRequired] IReadOnlyList<RunCardFace> Deck,
+    [property: JsonPropertyName("relics"), JsonRequired] IReadOnlyList<RunRelicFace> Relics,
+    [property: JsonPropertyName("potions"), JsonRequired] IReadOnlyList<string?> Potions);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunRelicFace(
+    [property: JsonPropertyName("model_id"), JsonRequired] string ModelId,
+    [property: JsonPropertyName("display_amount")] int? DisplayAmount);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunInitializationFacts(
+    [property: JsonPropertyName("character"), JsonRequired] string Character,
+    [property: JsonPropertyName("ascension"), JsonRequired] int Ascension,
+    [property: JsonPropertyName("use_character_starting_loadout"), JsonRequired] bool UseCharacterStartingLoadout,
+    [property: JsonPropertyName("loadout"), JsonRequired] RunPlayerFacts Loadout);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunCoordinate(
+    [property: JsonPropertyName("col"), JsonRequired] int Col, [property: JsonPropertyName("row")] int Row);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunHistoryCoordinate(
+    [property: JsonPropertyName("act"), JsonRequired] int Act, [property: JsonPropertyName("index")] int Index,
+    [property: JsonPropertyName("coord"), JsonRequired] RunCoordinate Coord);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunQuestMarkerFacts(
+    [property: JsonPropertyName("model_id"), JsonRequired] string ModelId,
+    [property: JsonPropertyName("act"), JsonRequired] int Act,
+    [property: JsonPropertyName("coordinates"), JsonRequired] IReadOnlyList<RunCoordinate> Coordinates);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunRewardFacts(
+    [property: JsonPropertyName("kind"), JsonRequired] string Kind,
+    [property: JsonPropertyName("amount")] int? Amount,
+    [property: JsonPropertyName("model_id")] string? ModelId,
+    [property: JsonPropertyName("cards"), JsonRequired] IReadOnlyList<RunCardFace> Cards,
+    [property: JsonPropertyName("resolved"), JsonRequired] bool Resolved);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunTreasureFacts(
+    [property: JsonPropertyName("opened"), JsonRequired] bool Opened,
+    [property: JsonPropertyName("relic_options"), JsonRequired] IReadOnlyList<string> RelicOptions);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunEventSelectionFacts(
+    [property: JsonPropertyName("ordinal"), JsonRequired] int Ordinal,
+    [property: JsonPropertyName("act"), JsonRequired] int Act,
+    [property: JsonPropertyName("history_index"), JsonRequired] int HistoryIndex,
+    [property: JsonPropertyName("operation_ordinal"), JsonRequired] int OperationOrdinal,
+    [property: JsonPropertyName("total_floor"), JsonRequired] int TotalFloor,
+    [property: JsonPropertyName("model_id"), JsonRequired] string ModelId,
+    [property: JsonPropertyName("eligible_event_ids"), JsonRequired] IReadOnlyList<string> EligibleEventIds,
+    [property: JsonPropertyName("has_lantern_key"), JsonRequired] bool HasLanternKey,
+    [property: JsonPropertyName("luminous_gold_eligible"), JsonRequired] bool LuminousGoldEligible,
+    [property: JsonPropertyName("failure_reason")] string? FailureReason);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RunRelicOperationFacts(
+    [property: JsonPropertyName("ordinal"), JsonRequired] int Ordinal,
+    [property: JsonPropertyName("act"), JsonRequired] int Act,
+    [property: JsonPropertyName("total_floor"), JsonRequired] int TotalFloor,
+    [property: JsonPropertyName("bag"), JsonRequired] string Bag,
+    [property: JsonPropertyName("producer"), JsonRequired] string Producer,
+    [property: JsonPropertyName("operation"), JsonRequired] string Operation,
+    [property: JsonPropertyName("rarity_source")] string? RaritySource,
+    [property: JsonPropertyName("filter")] string? Filter,
+    [property: JsonPropertyName("blacklist"), JsonRequired] IReadOnlyList<string> Blacklist,
+    [property: JsonPropertyName("pull_ordinal")] int? PullOrdinal,
+    [property: JsonPropertyName("model_id")] string? ModelId,
+    [property: JsonPropertyName("failure_reason")] string? FailureReason);
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record ComposeRunRootRequest(
-    [property: JsonPropertyName("root")] PortableRunRoot Root,
-    [property: JsonPropertyName("search_entropy")] long SearchEntropy);
+    [property: JsonPropertyName("root"), JsonRequired] PortableRunRoot Root,
+    [property: JsonPropertyName("search_entropy"), JsonRequired] long SearchEntropy);
 public sealed record EventResetRequest(
     [property: JsonPropertyName("state")] ResetRequest State,
     [property: JsonPropertyName("event_id")] string EventId);

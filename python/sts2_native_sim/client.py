@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import copy
+import math
 import os
 import queue
 import subprocess
@@ -71,15 +72,21 @@ class NativeWorker:
         project: str | Path | None = None,
         assembly: str | Path | None = None,
         request_timeout: float | None = None,
+        run_composition_timeout: float | None = None,
     ):
         default_godot, default_project, default_assembly = _defaults()
         self.command = [str(godot or default_godot), "--headless", "--path", str(project or default_project), "--", "--server", str(assembly or default_assembly)]
         self._lock = threading.Lock()
         self._logs: deque[str] = deque(maxlen=100)
         self._stdout_lines: queue.Queue[str | None] = queue.Queue()
-        self.request_timeout = request_timeout or float(os.environ.get("DIVINE_STS2_REQUEST_TIMEOUT", "60"))
-        if self.request_timeout <= 0:
-            raise ValueError("request_timeout must be positive")
+        self.request_timeout = request_timeout if request_timeout is not None else float(os.environ.get("DIVINE_STS2_REQUEST_TIMEOUT", "60"))
+        if not math.isfinite(self.request_timeout) or self.request_timeout <= 0:
+            raise ValueError("request_timeout must be finite and positive")
+        # XuShuxi: A bounded native posterior request can contain 8192 prior
+        # trials. Its finite watchdog is separate from one ordinary native step.
+        self.run_composition_timeout = run_composition_timeout if run_composition_timeout is not None else float(os.environ.get("DIVINE_STS2_RUN_COMPOSITION_TIMEOUT", "600"))
+        if not math.isfinite(self.run_composition_timeout) or self.run_composition_timeout <= 0:
+            raise ValueError("run_composition_timeout must be finite and positive")
         self._reset_state: dict[str, Any] | None = None
         self._reset_request: dict[str, Any] | None = None
         self._history: list[str] = []
@@ -154,7 +161,7 @@ class NativeWorker:
                 except Exception:
                     pass
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def request(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> Any:
         with self._lock:
             if self.process.poll() is not None:
                 raise NativeSimError("worker_crashed", f"worker exited {self.process.returncode}", list(self._logs))
@@ -162,14 +169,15 @@ class NativeWorker:
             assert self.process.stdin
             self.process.stdin.write(json.dumps({"id": request_id, "method": method, "params": params or {}}, separators=(",", ":")) + "\n")
             self.process.stdin.flush()
-            deadline = time.monotonic() + self.request_timeout
+            effective_timeout = self.request_timeout if timeout is None else timeout
+            deadline = time.monotonic() + effective_timeout
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._reap_process()
                     raise NativeSimError(
                         "request_timeout",
-                        f"{method} did not respond within {self.request_timeout:.1f} seconds",
+                        f"{method} did not respond within {effective_timeout:.1f} seconds",
                         list(self._logs),
                     )
                 try:
@@ -178,7 +186,7 @@ class NativeWorker:
                     self._reap_process()
                     raise NativeSimError(
                         "request_timeout",
-                        f"{method} did not respond within {self.request_timeout:.1f} seconds",
+                        f"{method} did not respond within {effective_timeout:.1f} seconds",
                         list(self._logs),
                     ) from None
                 if line is None:
@@ -374,7 +382,13 @@ class NativeWorker:
         return self.request("export_run_root", {})
 
     def compose_run_root(self, root: dict, *, search_entropy: int) -> dict:
-        return self.request("compose_run_root", {"root": root, "search_entropy": search_entropy})
+        """Install a v4 current public root and bounded joint posterior. Author: XuShuxi."""
+        result = self.request("compose_run_root", {"root": root, "search_entropy": search_entropy}, timeout=self.run_composition_timeout)
+        self._handle_histories.clear()
+        self._history = []
+        self._reset_state = self._reset_request = None
+        self._remember_handle(result["state"]["state_handle"])
+        return result
 
     def export_run_combat_root(self) -> dict:
         return self.request("export_run_combat_root", {})

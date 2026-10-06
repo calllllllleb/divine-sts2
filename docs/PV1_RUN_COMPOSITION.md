@@ -1,81 +1,147 @@
-# PV1 native Run composition contract
+# PV1 native mid-run Run composition contract
 
 Author: XuShuxi
 
-Implementation starts at `39bafd9e93c1e7b6922bcc4dd77ea4fcb8ad3449`.
-The mechanics authority remains the exact shipped `sts2.dll` and PCK.
+Baseline: `d69604b519b2fc238bc5b73c927b004070825783`.
+Branch: `pv1-general-midrun-composition-closure`; main is not merged.
+Mechanics authority: shipped STS2 v0.107.1, build
+`v0.107.1_a1f9e653f1e2_42520eb8b091`. Source evidence and the exact saved-state
+census are in [PV1_MIDRUN_SOURCE_AUDIT.md](PV1_MIDRUN_SOURCE_AUDIT.md).
+General mid-run composition is **not globally certified**.
 
-## Public observation
+## One public owner, two composition layers
 
-Every composed Run boundary carries the same minimal current Run/map surface and
-`public_run_memory` schema 1. The latter exposes visited event identities, ordered
-resolved rooms and observed encounters, revealed player/shared grab-bag pulls,
-shop-removal count, native Unknown-room odds, card-rarity odds, and potion odds.
-Pull interception publishes an identity only when its relic face is revealed.
-Restoring an earlier replay prefix clears the revelation ledger before replay.
-No native queue, RNG counter, save analytics, or mutable object is added to this
-public memory. Existing diagnostic raw observation fields retain their original
-contract; the Agent public projection must continue whitelisting them.
+Agent PolicyVisibleState remains the only model fact owner. Its existing
+PolicyVisibleRunMemory receives schema-3 public event-selection, ordered relic
+operation and quest-marker evidence. No second Agent Run state is introduced.
 
-Deck-choice presentation positions are certified only for the audited shipped
-deck screens that call `NCardGrid.SetCards(..., Ascending)`. This preserves visible
-slots without changing the completion's set/sequence semantics. Public card faces,
-including bundle/deck choices, contain only model, upgrades, resolved cost, X cost,
-and enchantment identity/amount. Gold and special-card rewards retain N1 faces.
+PortableRunRoot schema 4 separates `initialization` from `current_player`.
+Initialization records character/ascension and public initial loadout facts.
+Default character loadouts are captured from Player.CreateForNewRun/SetUpTest
+before bootstrap combat; fresh worlds call that producer again and verify its
+public output. Empty reset deck does not mean an empty default starting deck.
+The current public HP/maxHP/gold/block, card model/upgrades/enchantment,
+relic model/display counter, ordered potion belt, act/floor, topology, visited
+coordinates and public room/progression history are installed separately.
+`public_context` contains exactly act_index, act_floor, public_odds and room_history.
 
-Public combat movement evidence observes shipped pile commands without changing
-their mechanics. A top/bottom insertion is reported only when the native command
-advertises that position and the source card was in a visible Hand or DiscardPile.
-A draw reports its face only after the shipped first-card Draw enters Hand.
-Shuffles, random insertions, unknown-source insertions, and unaudited order changes
-invalidate known positions; they never publish realized hidden slots or faces.
-Async-local command scopes retain this distinction across native awaits.
+All Run DTOs reject unmapped fields; required fields and non-null public
+collections are checked before sampling. Roots cannot express seed, RNG counters,
+NativeState, native identity, future queues, private mutable state or a handle.
+`public_map` has a strict completed-topology whitelist; the private generation-time
+CanBeModified flag is omitted. Quest installation uses public ownership and the
+source census, never marker boolean as a guessed identity.
 
-## Search-private RPC
+## Joint posterior and finite rejection
 
-`export_run_root`, `compose_run_root`, and `export_run_combat_root` are private
-mechanics interfaces. Their payloads must never become model input or training
-records. Portable roots pin schema, DLL, and PCK. The Agent independently verifies
-the composed public root and public action identities before any simulation.
+For each independent search entropy, every candidate creates a new native Run
+and executes the complete RunManager.GenerateRooms prior. The shared Ancient
+subset allocation, shuffled events, weighted no-repeat encounter generation,
+relic bags, tutorial modifications and DoubleBoss behavior stay native.
 
-The certified Run composer accepts an initial, non-pending map root with no
-history, quest continuation, or private reset overrides. It creates a new native
-run from independent search entropy; all encounter/event/relic domains and RNG
-are generated anew. It then freezes the already-public current map and boss
-identities. A receipt lists the six closed domains and composer version
-`pv1-run-composition-v1`. The imported map is checked for unsupported quests as
-well, including special endpoints. There is no factual-seed replay fallback.
+`Z ~ native prior`; accept exactly when replay is consistent with relevant public
+history H. Accepted worlds therefore condition this joint prior on H. No resident
+factual suffix, factual seed or factual counter participates. Future randomness
+belongs to this independent search-local world.
 
-Nested combat export carries the current native combat substrate only to an
-isolated authority. Its reset includes a whitelist of public Act/floor, room
-history, odds scalars, and shop-removal count; full native history analytics and
-Run future queues are excluded. Warm combat snapshots restore the same public
-odds/counts, preventing earlier simulations from changing later simulations.
-Existing combat composition must independently resample draw order, monster
-belief, and future RNG before each inner simulation. Enchanted known-draw
-constraints distinguish otherwise identical public faces.
+Encounter replay calls PullNextEncounter/MarkRoomVisited in public act/category
+order and matches every observed model; public current boss/second boss also match.
+Event evidence records historical public eligibility ids, floor, LanternKey
+presence, observed final id and chronological operation position. Native cyclic
+scan, visited exclusion, hook fold and repetition fallback execute during replay.
+LuminousChoir is handled by its public gold predicate and that sampled world's
+native bag-availability query, preserving the joint event/bag dependency.
 
-## Explicit correctness blocker
+Relic evidence records ordered shared/player operations, producer, floor/act,
+source rarity roll or requested rarity, front/back direction, audited filter and
+public blacklist, causal removal reference and the revealed model id. Unrevealed
+pull identity stays null; only the sampled native world materializes it. Replay
+executes native filtering, refresh, rarity fallback and pull/remove behavior at
+that historical public context. The old unordered depletion is a derived view.
+Unknown filters/RNG-override producers reject with their named source reason.
 
-General non-initial Run roots are rejected with
-`run_conditional_history_unidentifiable`. Native
-`RoomSet.EnsureNextEventIsValid` silently skips ineligible, unvisited events, and
-`RelicGrabBag.RemoveDisallowedRelicsFromDeques` silently removes relics. Current
-public visited/depletion sets and odds do not retain historical eligibility
-contexts required to identify their conditional suffix distribution. Suspended
-modal/quest continuations also lack a certified portable reconstruction kernel.
-Copying the resident factual queues or factual seed is prohibited.
+Maximum attempts per composition request: **8192**. Exhaustion returns
+`run_composition_attempts_exhausted` with domain, attempt count, first contradicted
+public evidence and rejection counts. It never becomes a death outcome, factual
+fallback or ignored evidence. The Python client uses a separate finite composition
+watchdog (default 600 seconds); ordinary request timeouts retain their own limit.
+Rare long observed prefixes can exhaust this budget. Faster correct conditioning
+is performance work; deleting prefix constraints is not an optimization.
 
-This is a native composition blocker, not a claim that the complete PV1 end-state
-is achieved. A full factual run and an initial-root search do not certify general
-mid-run composition. Implementing a certified conditional kernel must preserve
-the frozen architecture, and must reject domains whose conditioning information
-cannot be reconstructed from audited public evidence.
+## Producer-specific current boundary regeneration
 
-## Headless presentation fixes
+The code matrix is `RunBoundaryContracts` in RunPublicRehydration.cs. All imported
+worlds must pass Agent's independent exact FullPolicyVisibleState and
+RunInformationState/public action-key gates before RunSearch can use them.
 
-The shipped DollRoom ambience path receives an inert audio presentation object.
-Sandpit's native test guards skip only Godot positions/music; its decrements and
-removal/death commands remain native. SoulNexus's native death handler executes
-its unsubscribe and receives a null presentation creature for its Spine update.
-No damage, reward, room, death, or eligibility mechanics are replaced.
+| Stage / native owner | Regeneration / current support | Explicit limit |
+| --- | --- | --- |
+| map / RunState.Map | frozen public map, history and coordinates | only certified inventory/history families |
+| ordinary room rewards / CombatRoom + RewardsSet | pre-finished combat room, EmptyForRoom, native ordinary reward constructors and public results/resolved indices | ExtraRewards, stolen/linked/special producer provenance reject |
+| rest / RestSiteRoom + RestSiteSynchronizer | BeginRestSite/GetLocalOptions, no duplicate AfterRoomEntered effects | started continuations other than certified Smith reject |
+| Smith outstanding card choice / SmithRestSiteOption | call native OnSelect again; suspends before mutation and retains genuine upgrade/AfterRestSiteSmith continuation | other CardSelectCmd producers reject |
+| treasure / TreasureRoomRelicSynchronizer | native BeginRelicPicking consumes this accepted world's already-materialized rarity/relic; public opened/options freeze | suppression/modified producers require their own evidence; completed leave-only boundary is transport |
+| shop / MerchantInventory | no portable regeneration | CreateForNormalMerchant price posterior, current purchases/refills and continuation not certified |
+| event / EventRoom + EventModel | historical selection is certified; current page regeneration is not | current page variables, rendered dynamic values and selected-prefix continuation need model-specific evidence |
+| custom reward / RewardsCmd.OfferCustom | no generic suspended-task restore | enclosing event/relic producer continuation not certified |
+| generic choice other than Smith / CardSelectCmd | no generic mutable-state restore | source producer, selected prefix and continuation not certified |
+
+Public current event hover-tip card/relic items are projected as existing public
+choice-item faces; hidden event candidates or page-private fields are not exposed.
+Public rest `selected` marks the actually clicked option and uses the existing
+Agent chosen-option field.
+
+## Persistent object and quest limits
+
+Seven settled public counter families reconstruct through RunPublicCounters.cs:
+HappyFlower, Nunchaku, IronClub, BookOfFiveRings, JossPaper, EmberTea and WingedBoots.
+ArtOfWar/PaelsTears combat flags reset at native AfterCombatEnd. Other declared
+saved/mutable fields reject with exact model/field names until their public
+reconstruction or lifecycle is certified. Deck afflictions/local cost modifiers,
+relic wax/melt and stack state reject separately; constructor defaults never
+silently replace an uncertified persistent instance.
+
+The map-marker denominator is exactly FUR_COAT and SPOILS_MAP. Ordered public
+marker facts permit source-specific owner installation. Missing old FurCoat
+coordinates, duplicate owners or unowned markers reject. Custom initial
+SpoilsMap is specifically rejected because CreateForTest skips AfterCreated and
+leaves SpoilsActIndex=-1, whereas real acquisition sets 1. Positive acquired-quest
+native certification is still outstanding. LanternKey's historical selection
+hook is replayed; ByrdonisEgg/Hatch's resulting Byrdpip has separately guarded
+Skin state. This is not a blanket `unsupported_run_quest_domain` claim.
+
+## Information and factual boundaries
+
+Search-private RPCs are export_run_root, compose_run_root and export_run_combat_root.
+The composition-v4 receipt has attempt count and sampled suffix commitments only
+for private acceptance diagnostics. It certifies the six named generator domains
+only for an accepted supported root, not every vanilla inventory/modal family.
+No receipt, commitment, entropy or native root enters model input or teacher data.
+Composed worlds cannot fork/restore a factual reset/history branch.
+
+Nested combat exports to an isolated authority and uses existing FR1B2 belief-safe
+composition from the then-visible combat boundary. Public act/history/odds migrate;
+parent Run hidden combat future does not. The shared PUCT mathematics, model,
+Combat belief/runtime and factual mechanics authority are unchanged.
+
+Native public movement evidence retains the earlier pile-command contract:
+visible-source advertised top/bottom insertions only; unknown/random changes
+invalidate known positions. The existing DollRoom, Sandpit and SoulNexus headless
+presentation seams remain presentation-only.
+
+## Delivery verification and pause
+
+Work pauses after the user's requested minimal verified delivery. The main native
+regression run passed 44 gates (including FR1C/SR1B/FR0/PV1 and new mid-run gates).
+The ordinary character-starting-loadout initial/mid-run root and strict protocol
+negatives passed separately; the factual three-Act path remains invariant and
+completed victory at 339 boundaries / 45 rooms / 27 encounters.
+
+The Treasure current-screen/continuation gate passed on real seed-74 public
+history: search entropy 95007 accepted after 7120 native candidates, pre-open and
+opened public state/actions matched, and native obtain/leave/map completed. Only
+one independent entropy witness is certified here. The preceding two-world target
+failed: eight bounded requests yielded one accepted world and seven 8192-attempt
+exhaustions. This failure is not converted into a diversity certificate. General
+mid-run composition remains unclosed; the Agent report lists each producer and
+instance gap rather than a compressed single blocker.

@@ -104,24 +104,26 @@ public sealed partial class PersistentNativeCombatEnvironment
             ["room_history"] = JsonSerializer.SerializeToElement(history, PortableRootJson)
         };
     }
-    private readonly HashSet<(string Bag, string Model)> _publicRunPulls = [];
-    private readonly HashSet<(string Bag, string Model)> _pendingPublicPulls = [];
+    private IEnumerable<(string Bag, string Model)> PublicObservedRunPulls()
+        => _runRelicOperations.Where(fact => fact.Operation is "front" or "back" && fact.ModelId is not null)
+            .Select(fact => (fact.Bag, fact.ModelId!)).Distinct();
     private readonly Dictionary<(int Act, int Index), (int Col, int Row)> _runRoomCoords = [];
+    // XuShuxi: Sequential worlds cannot reuse factual reset/history branches.
+    private bool _composedRunWorld;
 
     private void EnsureNoRunQuestDomain()
     {
-        // XuShuxi: Include special endpoints as well as GetAllMapPoints.
-        JsonElement map = JsonSerializer.SerializeToElement(PublicMapSnapshot());
-        if (map.GetProperty("points").EnumerateArray().Any(point => point.GetProperty("has_quest_marker").GetBoolean()))
-            throw new ProtocolException("unsupported_run_quest_domain", "Quest continuation needs a certified conditional root.");
-    }
-
-    private static void CapturePublicRelicPull(object __instance, object? __result)
-    {
-        var environment = _activeEnvironment;
-        if (environment is null || !environment._runMode || __result is null) return;
-        string bag = ReferenceEquals(__instance, ReflectionTools.Get(environment._run!, "SharedRelicGrabBag")) ? "shared" : "player";
-        environment._pendingPublicPulls.Add((bag, Entry(__result)));
+        CapturePublicQuestMarkers();
+        // XuShuxi: CreateForTest does not invoke Card.AfterCreated. This public
+        // initialization producer differs from acquiring SpoilsMap during a run.
+        if (_reset!.Deck.Any(card => card.ModelId == "SPOILS_MAP"))
+            throw new ProtocolException("run_quest_initialization_producer_missing",
+                "SPOILS_MAP in a custom initial deck: CreateForTest skips AfterCreated, so SpoilsActIndex is -1 rather than the acquired-card constant 1. A creation/removal journal is required before this initialization family can compose.");
+        if (_questEvidenceFailure is not null) throw new ProtocolException("run_quest_evidence_missing", _questEvidenceFailure);
+        if (ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "Relics")).Any(relic => Entry(relic!) == "FUR_COAT")
+            && !_runQuestMarkers.Any(fact => fact.ModelId == "FUR_COAT"))
+            throw new ProtocolException("run_quest_evidence_missing",
+                "FUR_COAT: no observed marked-coordinate journal; BeforeCombatStart reads old coordinates even after the owning act. Current marker absence cannot reconstruct that history.");
     }
 
     private object AugmentPublicRun(object observation)
@@ -130,22 +132,40 @@ public sealed partial class PersistentNativeCombatEnvironment
         JsonObject result = JsonSerializer.SerializeToNode(observation)!.AsObject();
         result["run"] = JsonSerializer.SerializeToNode(CurrentPublicRunSnapshot(ReflectionTools.Get(_player!, "Deck")!));
         result["map"] = JsonSerializer.SerializeToNode(PublicMapSnapshot());
+        CapturePublicQuestMarkers();
         HashSet<string> revealed = [];
-        void Visit(JsonNode? node)
+        void RelicFace(JsonNode? node)
         {
-            if (node is JsonObject obj)
+            if (node is JsonObject obj && obj["model_id"] is JsonValue value
+                && value.TryGetValue<string>(out string? id) && id is not null) revealed.Add(id);
+        }
+        // XuShuxi: Visibility is producer-specific. An old equipped relic with
+        // the same id never reveals an unopened chest or an unrelated old pull.
+        void Rewards(JsonNode? node)
+        {
+            if (node is JsonArray array) foreach (JsonNode? item in array) Rewards(item);
+            else if (node is JsonObject obj)
             {
-                if (obj["model_id"] is JsonValue value && value.TryGetValue<string>(out string? id) && id is not null) revealed.Add(id);
-                foreach (var pair in obj) Visit(pair.Value);
+                if (obj["kind"]?.GetValue<string>() == "relic") RelicFace(obj);
+                foreach (string child in new[] { "rewards", "children", "reward" }) if (obj[child] is { } items) Rewards(items);
             }
-            else if (node is JsonArray array) foreach (var item in array) Visit(item);
         }
-        Visit(result);
-        foreach (var pull in _pendingPublicPulls.Where(pull => revealed.Contains(pull.Model)).ToArray())
-        {
-            _publicRunPulls.Add(pull);
-            _pendingPublicPulls.Remove(pull);
-        }
+        Rewards(result["room_rewards"]); Rewards(result["outstanding_rewards"]); Rewards(result["custom_rewards"]);
+        RevealPublicRelicOperations(revealed, fact => fact.Producer.Contains("RelicReward"));
+        revealed.Clear();
+        foreach (JsonNode? entry in result["shop"]?["entries"]?.AsArray() ?? [])
+            if (entry?["kind"]?.GetValue<string>() == "relic") RelicFace(entry);
+        RevealPublicRelicOperations(revealed, fact => fact.Producer.Contains("Merchant"));
+        revealed.Clear();
+        foreach (JsonNode? entry in result["treasure"]?["relic_options"]?.AsArray() ?? []) RelicFace(entry);
+        RevealPublicRelicOperations(revealed, fact => fact.Producer.Contains("Treasure") || fact.Producer == "treasure_tutorial_first_chest");
+        revealed.Clear();
+        foreach (JsonNode? option in result["event"]?["options"]?.AsArray() ?? [])
+            foreach (JsonNode? item in option?["items"]?.AsArray() ?? [])
+                if (item?["kind"]?.GetValue<string>() == "relic") RelicFace(item);
+        string? eventType = _event?.GetType().Name;
+        RevealPublicRelicOperations(revealed, fact => eventType is not null && fact.Producer.Contains(eventType));
+        RevealPublicRelicOperations(_publicRelicAcquisitions, fact => eventType is not null && fact.Producer.Contains(eventType));
         result["public_run_memory"] = JsonSerializer.SerializeToNode(PublicRunMemorySnapshot());
         return result;
     }
@@ -188,10 +208,13 @@ public sealed partial class PersistentNativeCombatEnvironment
         object odds = ReflectionTools.Get(_player!, "PlayerOdds")!;
         return new
         {
-            schema_version = 1, complete = true,
+            schema_version = 3, complete = true,
+            event_selections = _runEventSelections,
+            relic_operations = _runRelicOperations.Where(fact => fact.FailureReason is null),
+            quest_markers = _runQuestMarkers,
             visited_event_ids = ReflectionTools.Enumerate(ReflectionTools.Get(_run!, "VisitedEventIds")).Where(x => x is not null).Select(x => ReflectionTools.Get(x!, "Entry")).ToArray(),
             rooms, encounters,
-            relic_pulls = _publicRunPulls.OrderBy(x => x.Bag).ThenBy(x => x.Model).Select(x => new { kind = "relic_pull", model_id = x.Model, act = 0, bag = x.Bag }).ToArray(),
+            relic_pulls = PublicObservedRunPulls().OrderBy(x => x.Bag).ThenBy(x => x.Model).Select(x => new { kind = "relic_pull", model_id = x.Model, act = 0, bag = x.Bag }).ToArray(),
             card_shop_removals_used = ReflectionTools.Get(ReflectionTools.Get(_player!, "ExtraFields")!, "CardShopRemovalsUsed"),
             unknown_monster_odds = ReflectionTools.Get(unknown, "MonsterOdds"), unknown_elite_odds = ReflectionTools.Get(unknown, "EliteOdds"),
             unknown_treasure_odds = ReflectionTools.Get(unknown, "TreasureOdds"), unknown_shop_odds = ReflectionTools.Get(unknown, "ShopOdds"),
@@ -203,57 +226,177 @@ public sealed partial class PersistentNativeCombatEnvironment
     public PortableRunRoot ExportRunRoot()
     {
         ThrowIfPoisoned(); EnsureReset();
-        // No copied factual ordering is permitted. Non-initial roots require a certified
-        // conditional history kernel, including silent eligibility skips/deletions.
-        if (!_runMode || _runStage != "map" || _history.Count != 0 || _pendingChoice is not null)
-            throw new ProtocolException("run_conditional_history_unidentifiable",
-                "This root needs native conditional event/relic history and current-continuation reconstruction; factual replay is prohibited.");
+        ValidateRunBoundary();
         if (_reset!.RunContext is not null || _reset.Enemies is not null || _reset.InitialDrawPile is not null
             || _reset.Deck.Any(card => card.NativeState is not null) || (_reset.Relics ?? []).Any(relic => relic.NativeState is not null)
             || (_reset.Potions ?? []).Any(potion => potion.NativeState is not null))
             throw new ProtocolException("unsupported_run_root_domain", "Unaudited reset-private domains cannot be copied into a Run world.");
         EnsureNoRunQuestDomain();
+        if (_runRelicOperations.FirstOrDefault(fact => fact.FailureReason is not null) is { } unsupported)
+            throw new ProtocolException("run_relic_producer_evidence_missing", unsupported.FailureReason!);
+        ValidateRunHistoryDomain(PublicCombatRunContext());
+        RunPlayerFacts current = ExportPublicRunPlayer();
+        RunPlayerFacts initial = InitialPublicRunPlayer();
+        ValidateRunPlayer(current); ValidateRunPlayer(initial);
         object map = ReflectionTools.Get(_run!, "Map")!;
         object serialized = ReflectionTools.InvokeStatic(T("MegaCrit.Sts2.Core.Saves.Runs.SerializableActMap"), "FromActMap", map)!;
+        JsonObject publicMap = JsonSerializer.SerializeToNode(serialized, PortableRootJson)!.AsObject();
+        // XuShuxi: CanBeModified is read only by generation-time MapPathPruning.
+        // A completed, frozen public topology does not need that private flag.
+        foreach (JsonNode? point in publicMap["points"]!.AsArray()) point!.AsObject().Remove("can_modify");
+        foreach (string endpoint in new[] { "start", "boss", "second_boss" })
+            if (publicMap[endpoint] is JsonObject point) point.Remove("can_modify");
         object act = ReflectionTools.Get(_run!, "Act")!;
-        return new(1, new(_productVersion, _assemblyHash, _pckHash),
-            _reset with { Seed = "SEARCH_PRIVATE", RngCounters = null, InitialHand = [],
-                          Turn = 1, Energy = null, Stars = null, InvokeCombatEntryHooks = false },
-            JsonSerializer.SerializeToElement(serialized, PortableRootJson),
+        // Initialization and current public resources have distinct owners. In
+        // particular _reset never supplies mid-run HP, inventory, or progression.
+        PortableRunRoot root = new(4, new(_productVersion, _assemblyHash, _pckHash),
+            new(_reset.Character, _reset.Ascension, _reset.UseCharacterStartingLoadout, initial),
+            current, PublicCombatRunContext(), PublicObservedRunPulls().OrderBy(pull => pull.Bag).ThenBy(pull => pull.Model).Select(pull => $"{pull.Bag}:{pull.Model}").ToArray(),
+            _runEventSelections.ToArray(), _runRelicOperations.ToArray(), _runQuestMarkers.ToArray(),
+            ReflectionTools.Enumerate(ReflectionTools.Get(_run!, "VisitedMapCoords")).Select(coord =>
+                new RunCoordinate(Convert.ToInt32(ReflectionTools.Get(coord!, "col")), Convert.ToInt32(ReflectionTools.Get(coord!, "row")))).ToArray(),
+            _runRoomCoords.OrderBy(pair => pair.Key).Select(pair => new RunHistoryCoordinate(pair.Key.Act, pair.Key.Index,
+                new(pair.Value.Col, pair.Value.Row))).ToArray(),
+            _runStage, ExportPublicTreasure(), _runStage == "rest" && _pendingChoice is not null ? _publicRestSelection : null, ExportPublicRoomRewards(),
+            JsonSerializer.SerializeToElement(publicMap, PortableRootJson),
             Entry(ReflectionTools.Get(act, "BossEncounter")!),
             ReflectionTools.Get(act, "SecondBossEncounter") is { } second ? Entry(second) : null);
+        ValidatePublicEventEvidence(root);
+        ValidatePublicRelicEvidence(root);
+        ValidatePublicQuestEvidence(root);
+        ValidatePublicTreasure(root);
+        return root;
     }
 
     public object ComposeRunRoot(ComposeRunRootRequest request)
     {
+        // XuShuxi: A malformed public contract is rejected before native work.
+        // This validation traverses only the protocol DTO, never a native owner.
+        ValidateRequiredPublicContract(request, new NullabilityInfoContext());
+        return ComposeValidatedRunRoot(request);
+    }
+
+    private static void ValidateRequiredPublicContract(object value, NullabilityInfoContext metadata)
+    {
+        foreach (PropertyInfo property in value.GetType().GetProperties())
+        {
+            object? child = property.GetValue(value);
+            NullabilityInfo contract = metadata.Create(property);
+            if (child is null)
+            {
+                if (contract.ReadState == NullabilityState.NotNull)
+                    throw new ProtocolException("invalid_public_run_root", $"Required public field {value.GetType().Name}.{property.Name} is null.");
+                continue;
+            }
+            if (child.GetType().Namespace == typeof(PortableRunRoot).Namespace)
+                ValidateRequiredPublicContract(child, metadata);
+            else if (child is System.Collections.IEnumerable items && child is not string)
+            {
+                foreach (object? item in items)
+                {
+                    if (item is null && contract.GenericTypeArguments.FirstOrDefault()?.ReadState == NullabilityState.NotNull)
+                        throw new ProtocolException("invalid_public_run_root", $"Null item in required public collection {property.Name}.");
+                    if (item?.GetType().Namespace == typeof(PortableRunRoot).Namespace)
+                        ValidateRequiredPublicContract(item!, metadata);
+                }
+            }
+        }
+    }
+
+    private object ComposeValidatedRunRoot(ComposeRunRootRequest request)
+    {
+        PortableRunRoot root = request.Root;
+        try { ValidateRunCompositionInputs(request); }
+        catch (Exception error) when (error is JsonException or KeyNotFoundException or InvalidOperationException or FormatException or OverflowException)
+        {
+            // Only input validation is translated. Native sampling/regeneration
+            // failures keep their real diagnostic rather than masquerading as JSON.
+            throw new ProtocolException("invalid_public_run_root", error.Message);
+        }
+        return ComposeValidatedRunWorld(root, request.SearchEntropy);
+    }
+
+    private void ValidateRunCompositionInputs(ComposeRunRootRequest request)
+    {
         PortableRunRoot root = request.Root;
         if (request.SearchEntropy < 0)
             throw new ProtocolException("invalid_search_entropy", "Search entropy must be nonnegative and independent.");
-        if (root.SchemaVersion != 1 || root.GameBuild.Version != _productVersion || root.GameBuild.AssemblySha256 != _assemblyHash || root.GameBuild.PckSha256 != _pckHash)
+        if (root.SchemaVersion != 4 || root.GameBuild.Version != _productVersion || root.GameBuild.AssemblySha256 != _assemblyHash || root.GameBuild.PckSha256 != _pckHash)
             throw new ProtocolException("run_root_version_mismatch", "Run schema/build mismatch.");
         // XuShuxi: Composer checks are independent of exporter checks. Handcrafted
         // requests cannot sneak a copied seed/counter or mutable hidden override in.
-        ResetRequest reset = root.PublicReset;
-        if (reset.Seed != "SEARCH_PRIVATE" || reset.RngCounters is not null || reset.RunContext is not null
-            || reset.Enemies is not null || reset.InitialDrawPile is not null
-            || reset.Deck.Any(card => card.NativeState is not null)
-            || (reset.Relics ?? []).Any(relic => relic.NativeState is not null)
-            || (reset.Potions ?? []).Any(potion => potion.NativeState is not null))
-            throw new ProtocolException("unsupported_run_root_domain", "Run public reset contains an unaudited private domain.");
-        // All native hidden domains are generated anew from independent search entropy.
-        // Current public map/boss facts are then frozen, with Agent equality validation.
-        RunReset(root.PublicReset with { Seed = $"run-search-{request.SearchEntropy:X16}", RngCounters = null });
+        ValidateRunPlayer(root.Initialization.Loadout); ValidateRunPlayer(root.CurrentPlayer);
+        if (root.Initialization.Loadout.Deck.Any(card => card.ModelId == "SPOILS_MAP"))
+            throw new ProtocolException("run_quest_initialization_producer_missing", "SPOILS_MAP custom initialization does not execute AfterCreated; acquiring the card and initializing the card are distinct public producers.");
+        ValidateRunHistoryDomain(root.PublicContext);
+        ValidatePublicEventEvidence(root);
+        ValidatePublicRelicEvidence(root);
+        ValidatePublicQuestEvidence(root);
+        ValidatePublicMap(root.PublicMap);
+        if (root.Stage is not ("map" or "rewards" or "rest" or "treasure"))
+            throw new ProtocolException("run_modal_producer_evidence_missing", $"Stage {root.Stage} has no certified native regeneration contract.");
+        if (root.Stage != "rewards" && root.Rewards.Count != 0)
+            throw new ProtocolException("invalid_run_modal_evidence", "Rewards outside their certified native owner.");
+        ValidatePublicTreasure(root);
+        if (root.RestSelection is not null && (root.Stage != "rest" || root.RestSelection != "SMITH"))
+            throw new ProtocolException("run_rest_continuation_evidence_missing", "Only SmithRestSiteOption's pre-selection continuation is certified: it has no mutation before FromDeckForUpgrade.");
+    }
+
+    private object ComposeValidatedRunWorld(PortableRunRoot root, long searchEntropy)
+    {
+        // XuShuxi: Rejection samples the complete native prior jointly, then
+        // consumes only certified public encounter evidence. No resident suffix
+        // participates in the sampler. Exhaustion is a protocol error, not death.
+        const int maxAttempts = 8192;
+        string contradiction = "encounter";
+        string? firstContradiction = null;
+        Dictionary<string, int> rejectedEvidence = [];
+        int attempts;
+        for (attempts = 1; attempts <= maxAttempts; attempts++)
+        {
+            // XuShuxi: Keep a finite rejection request's obsolete native owners
+            // collectable without reinstating the costly per-trial collection.
+            if (attempts % 256 == 0) GC.Collect(2, GCCollectionMode.Optimized, blocking: true, compacting: false);
+            ResetCore(IndependentRunReset(root.Initialization, searchEntropy, attempts), runPriorOnly: true);
+            if (root.Initialization.UseCharacterStartingLoadout && JsonSerializer.Serialize(_initialCharacterPublicLoadout, PortableRootJson)
+                    != JsonSerializer.Serialize(root.Initialization.Loadout, PortableRootJson))
+                throw new ProtocolException("invalid_run_initialization_public_facts", "The native character/ascension producer does not reproduce the supplied starting public loadout.");
+            _runMode = true;
+            ReflectionTools.Invoke(_manager!, "Reset", true);
+            ReflectionTools.Invoke(ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance")!, "GenerateRooms");
+            if (ReplayPublicEncounters(root, out contradiction) && ReplayPublicGeneratorOperations(root, out contradiction)) break;
+            firstContradiction ??= contradiction;
+            rejectedEvidence[contradiction] = rejectedEvidence.GetValueOrDefault(contradiction) + 1;
+        }
+        if (attempts > maxAttempts)
+            throw new ProtocolException("run_composition_attempts_exhausted",
+                $"domain=encounter_event_relic_joint; attempts={maxAttempts}; first_contradicted_public_evidence={firstContradiction}",
+                new { domain = "encounter_event_relic_joint", attempts = maxAttempts, first_contradicted_public_evidence = firstContradiction,
+                    rejected_public_evidence_counts = rejectedEvidence });
+        InstallPublicRunPlayer(root.CurrentPlayer);
+        _runEventSelections.AddRange(root.EventSelections);
+        _runRelicOperations.AddRange(root.RelicOperations);
+        _runQuestMarkers.AddRange(root.QuestMarkers);
+        _runEvidenceOrdinal = root.EventSelections.Count + root.RelicOperations.Count;
+        ApplyPublicCombatRunContext(root.PublicContext);
+        foreach (RunCoordinate coord in root.VisitedCoords)
+            if (!(bool)ReflectionTools.Invoke(_run!, "AddVisitedMapCoord", ReflectionTools.Create(T("MegaCrit.Sts2.Core.Map.MapCoord"), coord.Col, coord.Row))!)
+                throw new ProtocolException("invalid_public_run_progression", "Repeated visited coordinate.");
+        foreach (RunHistoryCoordinate coordinate in root.HistoryCoords)
+            _runRoomCoords[(coordinate.Act, coordinate.Index)] = (coordinate.Coord.Col, coordinate.Coord.Row);
         object mapSave = root.PublicMap.Deserialize(T("MegaCrit.Sts2.Core.Saves.Runs.SerializableActMap"), PortableRootJson)
             ?? throw new ProtocolException("invalid_public_map", "Public map deserialization failed.");
         ReflectionTools.Set(_run!, "Map", ReflectionTools.Create(T("MegaCrit.Sts2.Core.Map.SavedActMap"), mapSave));
+        InstallPublicQuestOwners(root);
         EnsureNoRunQuestDomain();
-        object act = ReflectionTools.Get(_run!, "Act")!;
-        object rooms = ReflectionTools.Get(act, "_rooms")!;
-        object db = ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Models.ModelDb"), "AllEncounters")!;
-        ReflectionTools.Set(rooms, "Boss", Find(db, root.Boss));
-        if (root.SecondBoss is not null) ReflectionTools.Set(rooms, "SecondBoss", Find(db, root.SecondBoss));
+        RegenerateRunBoundary(root);
+        _composedRunWorld = true;
         return new { state = Capture(new { kind = "run_belief_composition" }),
-                     composition = new { version = "pv1-run-composition-v1", closed_domains = new[] { "public", "public_derived", "encounters", "events", "relics", "future_rng" } } };
+                     composition = new { version = "pv1-run-composition-v4", attempts,
+                         encounter_suffix_commitment = SampledEncounterSuffixCommitment(),
+                         event_suffix_commitment = SampledEventSuffixCommitment(),
+                         relic_suffix_commitment = SampledRelicSuffixCommitment(),
+                         closed_domains = new[] { "public", "public_derived", "encounters", "events", "relics", "future_rng" } } };
     }
 
     public PortableCombatRoot ExportRunCombatRoot()

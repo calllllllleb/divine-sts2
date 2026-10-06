@@ -71,6 +71,9 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     private object? _roomRewardsSet;
     private readonly HashSet<int> _resolvedRoomRewards = [];
     private int? _pendingRoomRewardIndex;
+    // XuShuxi: Identity of the publicly clicked current rest option, not a task
+    // or native continuation snapshot. Reset/re-entry always clears this fact.
+    private string? _publicRestSelection;
     private object? _treasureRoom, _treasureSynchronizer;
     private bool _treasureOpened, _treasureResolved;
     private object? _merchantRoom, _merchantInventory;
@@ -168,6 +171,10 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     }
 
     public EnvironmentResult Reset(ResetRequest request)
+        => ResetCore(request, runPriorOnly: false)!;
+
+    // XuShuxi: Prior trials use native initialization without bootstrap combat.
+    private EnvironmentResult? ResetCore(ResetRequest request, bool runPriorOnly)
     {
         ThrowIfPoisoned();
         _monsterRollEvents.Clear();
@@ -175,11 +182,15 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         _monsterMoveEventSequence = 0;
         QuiesceOutstandingTransition();
         _branches.Clear();
+        _composedRunWorld = false;
+        ClearRunGeneratorEvidence();
+        _publicRestSelection = null;
+        _initialCharacterPublicLoadout = null;
         _branchOrder.Clear();
         _cardInstanceIds.Clear();
         _combatCreaturesById.Clear();
-        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-        _publicRunPulls.Clear(); _pendingPublicPulls.Clear(); _runRoomCoords.Clear(); _runMode = false; _runStage = "map"; _runWon = false; _roomRewardsSet = null; _resolvedRoomRewards.Clear(); _pendingRoomRewardIndex = null; _pendingRewardsSet = null; _pendingRewardSelection = null; _customRewardMode = false; _customRewardsLinked = false; _customRewardKinds = []; _treasureRoom = null; _treasureSynchronizer = null; _treasureOpened = false; _treasureResolved = false; _merchantRoom = null; _merchantInventory = null; _merchantEntryIdentities.Clear(); _mapMode = false; _rewardMode = false; _rewardKind = "card"; _rewardModelId = null; _cardReward = null; _restMode = false; _eventMode = false; _eventId = null; _event = null; Validate(request); _reset = request; _history.Clear(); _currentBranchHandle = null; _lastActionId = null; Construct(request);
+        if (!runPriorOnly) GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        _runRoomCoords.Clear(); _runMode = false; _runStage = "map"; _runWon = false; _roomRewardsSet = null; _resolvedRoomRewards.Clear(); _pendingRoomRewardIndex = null; _pendingRewardsSet = null; _pendingRewardSelection = null; _customRewardMode = false; _customRewardsLinked = false; _customRewardKinds = []; _treasureRoom = null; _treasureSynchronizer = null; _treasureOpened = false; _treasureResolved = false; _merchantRoom = null; _merchantInventory = null; _merchantEntryIdentities.Clear(); _mapMode = false; _rewardMode = false; _rewardKind = "card"; _rewardModelId = null; _cardReward = null; _restMode = false; _eventMode = false; _eventId = null; _event = null; Validate(request); _reset = request; _history.Clear(); _currentBranchHandle = null; _lastActionId = null; Construct(request, runPriorOnly);
         try
         {
             object? runManager = ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance");
@@ -191,7 +202,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             }
         }
         catch { }
-        return Capture(new { kind = "reset", replayed_actions = 0 });
+        return runPriorOnly ? null : Capture(new { kind = "reset", replayed_actions = 0 });
     }
     public EnvironmentResult RunReset(ResetRequest request)
     {
@@ -251,6 +262,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         // action never contaminates the branch edge recorded by GetOrAddCurrentBranch().
         LegalAction action = BuildActions().SingleOrDefault(x => x.ActionId == actionId)
             ?? throw new ProtocolException("invalid_action", $"Action '{actionId}' is not legal in state {_hash}.");
+        _publicRelicAcquisitions.Clear();
         // XuShuxi: Capture only an ordinary mechanical anchor. A pending
         // continuation is never serialized; restore recreates it with one action.
         bool certifiedTrigger = action.Kind == "play_card" && _cardInstanceIds.Keys
@@ -1123,11 +1135,18 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         return result with { Transition = new { kind = "monster_move_reconstruction", replayed_actions = 0 } };
     }
 
-    public string Fork() => GetOrAddCurrentBranch();
+    public string Fork()
+    {
+        if (_runMode && _composedRunWorld)
+            throw new ProtocolException("unsupported_composed_run_branch", "Acquire another independent Run world; factual reset/history replay cannot restore a composed public root.");
+        return GetOrAddCurrentBranch();
+    }
     public object Diagnostics() => new { branch_count = _branches.Count, branch_capacity = BranchCapacity, history_length = _history.Count, current_state_hash = _hash, last_snapshot_debug = _lastSnapshotDebug };
 
     public async Task<EnvironmentResult> RestoreAsync(string id)
     {
+        if (_runMode && _composedRunWorld)
+            throw new ProtocolException("unsupported_composed_run_branch", "A composed Run world has no factual snapshot/history restore path.");
         ThrowIfPoisoned();
         if (!_branches.TryGetValue(id, out Branch? branch)) throw new ProtocolException("unknown_state_handle", id);
         List<string> branchHistory = ResolveBranchHistory(branch);
@@ -1188,8 +1207,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
 
         // XuShuxi: Reconstruct public history from this prefix; a discarded
         // descendant's revealed relic pulls/coordinates cannot survive restore.
-        _publicRunPulls.Clear(); _pendingPublicPulls.Clear(); _runRoomCoords.Clear();
-        _reset = branch.Reset; _history.Clear(); _cardInstanceIds.Clear(); _combatCreaturesById.Clear(); _dynamicCardOrdinal = 0; _currentBranchHandle = null; _lastActionId = null; Construct(branch.Reset); _runMode = branch.RunMode; _runStage = "map"; _pendingRewardsSet = null; _pendingRewardSelection = null;
+        _runRoomCoords.Clear();
+        _reset = branch.Reset; _history.Clear(); ClearRunGeneratorEvidence(); _cardInstanceIds.Clear(); _combatCreaturesById.Clear(); _dynamicCardOrdinal = 0; _currentBranchHandle = null; _lastActionId = null; Construct(branch.Reset); _runMode = branch.RunMode; _runStage = "map"; _pendingRewardsSet = null; _pendingRewardSelection = null;
         _mapMode = !_runMode && branch.MapMode; _rewardMode = !_runMode && branch.RewardMode; _rewardKind = branch.RewardKind; _rewardModelId = branch.RewardModelId; _restMode = !_runMode && branch.RestMode; _eventMode = !_runMode && branch.EventMode; _eventId = branch.EventId;
         _customRewardMode = branch.CustomRewardMode; _customRewardsLinked = branch.CustomRewardsLinked; _customRewardKinds = branch.CustomRewardKinds;
         if (_runMode) InitializeRunMap();
@@ -1217,7 +1236,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         InstallSeam(); InstallChoiceSelector();
     }
 
-    private void Construct(ResetRequest r)
+    private void Construct(ResetRequest r, bool runPriorOnly = false)
     {
         Type db = T("MegaCrit.Sts2.Core.Models.ModelDb"), playerType = T("MegaCrit.Sts2.Core.Entities.Players.Player");
         // Cancel and detach every shipped combat continuation before replacing the
@@ -1312,6 +1331,21 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         {
             object result = ReflectionTools.Invoke(_player, "AddPotionInternal", Mutable("AllPotions", potion.ModelId), potion.Slot, true)!;
             if (!(bool)ReflectionTools.Get(result, "success")!) throw new ProtocolException("invalid_reset", $"Could not place potion {potion.ModelId} in slot {potion.Slot}.");
+        }
+
+        // Public facts only, and no extra lifecycle execution on the factual run.
+        // Validation belongs to export/compose, so Combat resets retain their
+        // existing breadth even for stateful character starting inventories.
+        if (r.UseCharacterStartingLoadout) _initialCharacterPublicLoadout = ExportPublicRunPlayer(validateInstances: false);
+
+        if (runPriorOnly)
+        {
+            // Native SetUpTest already populated both grab bags from UpFront.
+            // EncounterModel's bootstrap RNG is encounter-local; draw setup uses
+            // Shuffle. Neither belongs to the joint Run-generator prior.
+            _manager = nativeCombatManager; _combat = null; _pcs = null;
+            InitEvents(_manager);
+            return;
         }
 
         object encounterModel = r.Encounter.Equals("first", StringComparison.OrdinalIgnoreCase) ? ReflectionTools.Enumerate(ReflectionTools.GetStatic(db, "AllEncounters")).First(x => x is not null)! : Find(ReflectionTools.GetStatic(db, "AllEncounters")!, r.Encounter);
@@ -1789,6 +1823,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         else if (roomType == "RestSite")
         {
             _runStage = "rest"; _restMode = true;
+            _publicRestSelection = null;
             _restOptions = ReflectionTools.Enumerate(ReflectionTools.Get(room, "Options")).Where(option => option is not null).Select(option => option!).ToArray();
             _restSelectionStarted = false;
         }
@@ -2117,6 +2152,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
 
     private void InitializeRestSite()
     {
+        _publicRestSelection = null;
         if (ReflectionTools.Get(_run!, "CurrentMapPointHistoryEntry") is null)
         {
             object pointType = Enum.Parse(T("MegaCrit.Sts2.Core.Map.MapPointType"), "RestSite");
@@ -2143,6 +2179,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     private async Task ChooseRestAsync(string optionId)
     {
         object option = _restOptions.Single(option => StringComparer.Ordinal.Equals(ReflectionTools.Get(option, "OptionId"), optionId));
+        _publicRestSelection = optionId;
         _restSelectionStarted = true;
         await StartTransitionAsync(() => (Task)ReflectionTools.Invoke(option, "OnSelect")!);
     }
@@ -2156,7 +2193,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         {
             option_id = ReflectionTools.Get(option, "OptionId"),
             enabled = ReflectionTools.Get(option, "IsEnabled"),
-            implementation = option.GetType().Name
+            implementation = option.GetType().Name,
+            selected = StringComparer.Ordinal.Equals(_publicRestSelection, ReflectionTools.Get(option, "OptionId"))
         }).ToArray();
         object? choice = _pendingChoice?.Snapshot();
         object observation = new
@@ -2295,7 +2333,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             text_key = ReflectionTools.Get(option, "TextKey"),
             locked = ReflectionTools.Get(option, "IsLocked"),
             chosen = ReflectionTools.Get(option, "WasChosen"),
-            is_proceed = ReflectionTools.Get(option, "IsProceed")
+            is_proceed = ReflectionTools.Get(option, "IsProceed"),
+            items = PublicEventOptionItems(option)
         }).Where(option => option is not null).ToArray()!;
         bool finished = (bool)ReflectionTools.Get(_event, "IsFinished")!;
         object observation = new
@@ -2571,6 +2610,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         int actCount = ReflectionTools.Enumerate(ReflectionTools.Get(_run!, "Acts")).Count;
         ReflectionTools.Set(_run!, "ActFloor", Convert.ToInt32(ReflectionTools.Get(_run!, "ActFloor")) + 1);
         _restMode = false; _eventMode = false; _event = null; _eventId = null;
+        _publicRestSelection = null;
         if (priorAct < actCount - 1)
         {
             if (ReflectionTools.Invoke(runManager, "ExitCurrentRooms") is Task exit) await exit.ConfigureAwait(false);
@@ -3294,13 +3334,12 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         void P(MethodInfo m, string n) => patch.Invoke(harmony, [m, Activator.CreateInstance(hmt, typeof(PersistentNativeCombatEnvironment).GetMethod(n, BindingFlags.NonPublic | BindingFlags.Static)!), null, null, null]);
         void Po(MethodInfo m, string n) => patch.Invoke(harmony, [m, null, Activator.CreateInstance(hmt, typeof(PersistentNativeCombatEnvironment).GetMethod(n, BindingFlags.NonPublic | BindingFlags.Static)!), null, null]);
         InstallPublicMovementObservers(P, Po);
+        InstallRunEventObservers(P, Po);
+        InstallRunRelicObservers(P, Po);
         P(T("MegaCrit.Sts2.Core.Models.MonsterModel").GetMethod("RollMove", BindingFlags.Public | BindingFlags.Instance)!, nameof(CaptureMonsterRollContext));
         MethodInfo stun = T("MegaCrit.Sts2.Core.Entities.Creatures.Creature").GetMethod("StunInternal", BindingFlags.Public | BindingFlags.Instance)!;
         P(stun, nameof(CaptureStunBefore));
         Po(stun, nameof(CaptureStunAfter));
-        foreach (MethodInfo pull in T("MegaCrit.Sts2.Core.Runs.RelicGrabBag").GetMethods(BindingFlags.Public | BindingFlags.Instance)
-                     .Where(method => method.Name is "PullFromFront" or "PullFromBack"))
-            Po(pull, nameof(CapturePublicRelicPull));
         Type monsterModel = T("MegaCrit.Sts2.Core.Models.MonsterModel");
         MethodInfo nextMoveGetter = monsterModel.GetProperty("NextMove", BindingFlags.Public | BindingFlags.Instance)!.GetMethod!;
         Po(nextMoveGetter, nameof(CaptureImmediateTriggerProbe));

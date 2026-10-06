@@ -264,7 +264,12 @@ async Task<int> ServeAsync(PersistentNativeCombatEnvironment environment)
     return 0;
 }
 
-T Read<T>(JsonElement element) => element.Deserialize<T>(Json) ?? throw new ProtocolException("invalid_params", typeof(T).Name);
+// XuShuxi: Strict public-root schema violations are protocol rejections.
+T Read<T>(JsonElement element)
+{
+    try { return element.Deserialize<T>(Json) ?? throw new ProtocolException("invalid_params", typeof(T).Name); }
+    catch (JsonException error) { throw new ProtocolException("invalid_params", error.Message); }
+}
 
 file static class NativeSimWindowsErrorMode
 {
