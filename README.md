@@ -10,7 +10,7 @@ High-throughput, deterministic, headless reinforcement learning and MCTS executi
 
 Executes game mechanics directly from your local Steam installation inside isolated, presentation-suppressed .NET 9 workers. Contains zero copyrighted assets, game binaries, or proprietary art.
 
-Portable combat roots require schema 8 / shared history v5 and the fixed-DLL history consumption contract. Common resident Power references and versioned actual card DynamicVars compose in the same root. Cards retain SovereignBlade private damage/repeats; native Forge damage and zero-replay branch restoration are verified. See [card dynamic runtime scope and native evidence](docs/CARD_DYNAMIC_RUNTIME.md). History-only native type/ID carriers keep dead enemy identity without future FSM reconstruction. General training closure remains open. See [the shared history contract](docs/SHARED_COMBAT_HISTORY.md).
+Portable combat roots require schema 8 / shared history v5 and the fixed-DLL history consumption contract. Common resident Power references, actual card DynamicVars and [reviewed retired Power cards](docs/RETIRED_COMBAT_CARDS.md) compose in the same root. Real Juggling history clone/autoplay and zero-replay restoration retain native card and Deck identity without reviving the source into a pile. Cards retain SovereignBlade private damage/repeats; see [card dynamic runtime scope](docs/CARD_DYNAMIC_RUNTIME.md). History-only native type/ID carriers keep dead enemy identity without future FSM reconstruction. General training closure remains open. See [the shared history contract](docs/SHARED_COMBAT_HISTORY.md).
 
 ---
 

@@ -432,23 +432,29 @@ public sealed partial class PersistentNativeCombatEnvironment
         string? handle = _currentBranchHandle;
         string stage = _runStage;
         ResetRequest reset = _reset!;
+        var priorDeckBindings = new Dictionary<string, object>(_baseResetDeckCards, StringComparer.Ordinal);
         try
         {
             // XuShuxi: This is an opaque query substrate. It is imported only into
             // an isolated authority; existing Combat composition resamples its
             // draw/monster/future-RNG domains before every inner simulation.
             object creature = ReflectionTools.Get(_player!, "Creature")!;
+            var currentDeckBindings = new Dictionary<string, object>(StringComparer.Ordinal);
             CardSpec[] deck = ReflectionTools.Enumerate(ReflectionTools.Get(ReflectionTools.Get(_player!, "Deck")!, "Cards"))
                 .Where(card => card is not null).Select((value, index) =>
                 {
                     object card = value!;
                     string id = _cardInstanceIds.Where(pair => ReferenceEquals(ReflectionTools.Get(pair.Key, "DeckVersion"), card))
                         .Select(pair => pair.Value).FirstOrDefault() ?? $"run-deck-{index}";
+                    if (!currentDeckBindings.TryAdd(id, card))
+                        throw RetiredCardError("BaseReset.Deck", "Ambiguous exact native Deck instance alias.");
                     object? enchantment = ReflectionTools.Get(card, "Enchantment");
                     return new CardSpec(id, Entry(card), Convert.ToInt32(ReflectionTools.Get(card, "CurrentUpgradeLevel")),
                         SavedNativeState(card).ToDictionary(pair => pair.Key, pair => JsonSerializer.SerializeToElement(pair.Value)),
                         enchantment is null ? null : new EnchantmentSpec(Entry(enchantment), Convert.ToInt32(ReflectionTools.Get(enchantment, "Amount"))));
                 }).ToArray();
+            _baseResetDeckCards.Clear();
+            foreach ((string id, object card) in currentDeckBindings) _baseResetDeckCards.Add(id, card);
             RelicSpec[] relics = ReflectionTools.Enumerate(ReflectionTools.Get(_player!, "Relics"))
                 .Where(value => value is not null).Select(value => new RelicSpec(Entry(value!),
                     null, SavedNativeState(value!).ToDictionary(pair => pair.Key, pair => JsonSerializer.SerializeToElement(pair.Value)))).ToArray();
@@ -463,6 +469,10 @@ public sealed partial class PersistentNativeCombatEnvironment
             _runStage = "map";
             return ExportCombatRoot();
         }
-        finally { _reset = reset; _runStage = stage; _runMode = mode; _hash = hash; _currentBranchHandle = handle; }
+        finally {
+            _baseResetDeckCards.Clear();
+            foreach ((string id, object card) in priorDeckBindings) _baseResetDeckCards.Add(id, card);
+            _reset = reset; _runStage = stage; _runMode = mode; _hash = hash; _currentBranchHandle = handle;
+        }
     }
 }

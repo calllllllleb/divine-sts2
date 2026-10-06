@@ -1,7 +1,7 @@
 # Card dynamic runtime v1
 
-Portable combat root schema **7** requires an explicit `dynamic_runtime` on
-every resident CardSnapshot. Schema 6 and missing/old/unknown carriers reject
+Portable combat root schema **8** requires an explicit `dynamic_runtime` on
+every executable CardSnapshot, including [retired combat cards](RETIRED_COMBAT_CARDS.md). Schemas 6/7 and missing/old/unknown carriers reject
 before target reset. Shared combat history remains **v5** with the unchanged
 `pinned-singleplayer-history-read-v1` fixed-DLL consumer contract.
 The reviewed DLL SHA256 is

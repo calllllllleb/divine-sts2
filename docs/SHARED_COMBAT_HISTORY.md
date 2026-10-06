@@ -27,8 +27,9 @@ same codec. Resident ChainsOfBindingPower still restores its real private
 
 CardModel also stays executable. HistoryCourse selects an actual historical
 card and calls CreateDupe/CreateClone/AutoPlay. Cards therefore retain the full
-existing resident card codec; removed, foreign-owned or unsupported dupe cards
-still reject. CardPlay and DamageResult shared instances retain all existing
+executable card codec. [Reviewed retired Power cards](RETIRED_COMBAT_CARDS.md)
+also remain executable without rejoining a pile; foreign owners, unsupported
+retired profiles and dupe/clone lineage still reject. CardPlay and DamageResult shared instances retain all existing
 fields, resource values, nullable targets, result piles and replay flags.
 
 Only detached history-only Monster/Move/Power/Orb/Potion/Affliction references
@@ -171,7 +172,7 @@ TraceExporterSmoke project; this change contains no game binaries or native
 decompiled source. A separate allocation-only native MoveState witness confirms
 that PerformMove throws `unsupported_history_execution`.
 
-General training/full-run closure remains open: unsupported removed/dupe cards,
+General training/full-run closure remains open: unsupported retired/dupe profiles,
 other detached Creature profiles, models outside the native catalogs, unreviewed
 live private-state paths and the previously observed resident SlowPower display
 mismatch are not certified here. Pending choice and Run composition retain

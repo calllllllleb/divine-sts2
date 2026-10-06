@@ -44,7 +44,7 @@ def test_real_forge_cross_worker_damage_and_zero_replay_old_branch():
         state = _play(source, state, 1)  # Native Bulwark -> ForgeCmd.Forge(10).
         root = source.export_combat_root()
         frozen = deepcopy(root)
-        assert root["schema_version"] == 7 and source.hello()["card_dynamic_runtime_version"] == 1
+        assert root["schema_version"] == 8 and source.hello()["card_dynamic_runtime_version"] == 1
         blade = _card(root, 0)
         assert _value(blade, "Damage") == blade["dynamic_runtime"]["sovereign_blade"]["current_damage"] == "20"
         assert blade["saved_properties"] == {}

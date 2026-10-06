@@ -103,6 +103,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         combat_history_contract_version = CombatHistoryContractVersion,
         combat_history_consumer_contract = HistoryConsumerContract,
         card_dynamic_runtime_version = CardDynamicRuntimeVersion,
+        retired_combat_card_version = RetiredCardVersion,
         game_build = new { version = _productVersion, assembly_sha256 = _assemblyHash, pck_sha256 = _pckHash },
         methods = new[] { "hello", "catalog", "reset", "run_reset", "map_reset", "reward_reset", "item_reward_reset", "custom_reward_reset", "rest_reset", "event_reset", "observe", "run_observe", "map_observe", "reward_observe", "custom_reward_observe", "rest_observe", "event_observe", "legal_actions", "step", "run_step", "map_step", "reward_step", "custom_reward_step", "rest_step", "event_step", "fork", "restore", "export_run_root", "export_run_mechanical_root", "compose_run_root", "compose_run_root_reference", "export_run_combat_root", "export_combat_root", "import_combat_root", "resample_draw_order", "fork_future_rng", "describe_monster_move_candidates", "describe_monster_move_rules", "describe_monster_roll_events", "describe_monster_transient_events", "describe_monster_immediate_rule", "describe_monster_roll_rules", "reconstruct_monster_moves", "describe_monster_rng_provenance", "diagnostics", "close" },
         supported_subset = new { characters = "native CharacterModel entries", encounters = "native EncounterModel entries", cards = "base/upgraded cards plus asynchronous native card, bundle, and relic choices", actions = new[] { "play_card", "use_potion", "discard_potion", "end_turn", "choose_cards", "choose_option", "choose_map", "choose_reward", "choose_rest", "choose_event", "open_treasure", "choose_treasure", "buy_shop", "choose_custom_reward", "skip_custom_rewards", "advance_act" }, potions = true, map = "native deterministic routing graph with composed combat, rest, event, treasure, shop, and inter-act transitions", events = "native model initialization, option continuations, nested event-created combats, blocking custom/linked rewards, and the final victory event" }
@@ -408,6 +409,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         }
         catch (JsonException ex) { throw new ProtocolException("invalid_combat_history", "Invalid combat snapshot/history JSON: " + ex.Message); }
         ValidateOstyEntityDescriptor(snapshot);
+        ValidateCombatCardDomain(snapshot);
+        ValidateRetiredDeckAliases(snapshot, root.BaseReset);
         ValidateCombatHistory(snapshot);
         ValidateCardDynamicRuntimes(snapshot);
         foreach (EnemySnapshot enemy in snapshot.Enemies)
@@ -438,6 +441,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             throw new ProtocolException("combat_root_history_mismatch", "Imported shared history fingerprint differs.");
         if (!PlayerPowerRuntimeFingerprintMatches(snapshot, actual))
             throw new ProtocolException("combat_root_power_mismatch", "Imported player Power references/runtime fingerprint differs.");
+        if (!CombatCardDomainFingerprintMatches(snapshot, actual))
+            throw new ProtocolException("combat_root_card_membership_mismatch", "Imported combat card membership/runtime fingerprint differs.");
         if (!CardDynamicRuntimeFingerprintMatches(snapshot, actual))
             throw new ProtocolException("combat_root_card_dynamic_mismatch", "Imported card dynamic runtime fingerprint differs.");
         timer.Stop();
@@ -1295,6 +1300,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         object unlock = ReflectionTools.Create(T("MegaCrit.Sts2.Core.Unlocks.UnlockState"), new List<string>(), List(T("MegaCrit.Sts2.Core.Models.ModelId"), []), 0);
         _player = playerType.GetMethods(BindingFlags.Public | BindingFlags.Static).Single(x => x.Name == "CreateForNewRun" && x.GetParameters().Length == 3).Invoke(null, [character, unlock, (ulong)1])!;
         _cardInstanceIds.Clear();
+        _baseResetDeckCards.Clear();
         _choiceOrdinal = 0; _dynamicCardOrdinal = 0; _pendingAnchor = null; _pendingChoice = null; _continuationTask = null;
         object deck = ReflectionTools.Get(_player, "Deck")!;
         if (!r.UseCharacterStartingLoadout) ReflectionTools.Invoke(deck, "Clear", true);
@@ -1379,6 +1385,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             string prefix = r.UseCharacterStartingLoadout ? "starter" : "native-added";
             deckVersions.Add($"{prefix}-{loadoutOrdinal++}-{Entry(nativeCard)}", nativeCard);
         }
+        foreach ((string id, object card) in deckVersions) _baseResetDeckCards.Add(id, card);
 
         if (!r.UseCharacterStartingLoadout)
         {
@@ -3970,6 +3977,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     {
         EnsureReset();
         string? cardDynamicFingerprint = CurrentCardDynamicRuntimeFingerprint();
+        string? cardDomainFingerprint = CurrentCombatCardDomainFingerprint();
 
         // Passive-observe idempotency fast path: if no action edge is pending
         // (_lastActionId == null) and the worker already has a branch handle that
@@ -3981,7 +3989,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             _branches.TryGetValue(_currentBranchHandle, out Branch? resident) &&
             StringComparer.Ordinal.Equals(resident.ExpectedHash, _hash)
             && (resident.MechanicsSnapshot is null
-                || cardDynamicFingerprint == CardDynamicRuntimeFingerprint(resident.MechanicsSnapshot)))
+                || (cardDynamicFingerprint == CardDynamicRuntimeFingerprint(resident.MechanicsSnapshot)
+                    && cardDomainFingerprint == CombatCardDomainFingerprint(resident.MechanicsSnapshot))))
         {
             _branchOrder.Remove(_currentBranchHandle);
             _branchOrder.AddLast(_currentBranchHandle);
@@ -3995,7 +4004,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             expected_hash = _hash,
             reset = _reset,
             kernel = TransitionKernelSnapshot(),
-            card_dynamic_runtime = cardDynamicFingerprint
+            card_dynamic_runtime = cardDynamicFingerprint,
+            combat_card_domain = cardDomainFingerprint
         });
         string id = "s:" + Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(payload)));
         // Fast path: if the current branch handle already maps to exactly this
@@ -4238,49 +4248,13 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             uint nextCardId = ReflectionTools.Get(cardDb, "_nextId") is uint next ? next
                 : throw new ProtocolException("unsupported_card_db", "Expected UInt32 _nextId.");
 
-            // Cards in all 5 piles
-            List<CardSnapshot> CapturePile(string name)
-            {
-                object pile = ReflectionTools.Get(_pcs, name)!;
-                List<CardSnapshot> list = [];
-                foreach (object? card in ReflectionTools.Enumerate(ReflectionTools.Get(pile, "Cards")))
-                {
-                    if (card is null) continue;
-                    string instanceId = GetCardInstanceId(card);
-                    string modelId = Entry(card);
-                    int upgrades = Convert.ToInt32(ReflectionTools.Get(card, "CurrentUpgradeLevel"));
-                    object cost = ReflectionTools.Get(card, "EnergyCost")!;
-                    int resolvedCost = Convert.ToInt32(ReflectionTools.Invoke(cost, "GetResolved"));
-                    int baseCost = Convert.ToInt32(ReflectionTools.Get(cost, "_base") ?? 0);
-                    bool retain = Convert.ToBoolean(ReflectionTools.Get(card, "_hasSingleTurnRetain") ?? false);
-                    bool sly = Convert.ToBoolean(ReflectionTools.Get(card, "_hasSingleTurnSly") ?? false);
-                    bool exhaust = Convert.ToBoolean(ReflectionTools.Get(card, "_exhaustOnNextPlay") ?? false);
-                    string? enchModel = ReflectionTools.Get(card, "Enchantment") is { } ench ? Entry(ench) : null;
-                    decimal enchAmount = ReflectionTools.Get(card, "Enchantment") is { } ench2 ? Convert.ToDecimal(ReflectionTools.Get(ench2, "Amount")) : 0m;
-                    object? affliction = ReflectionTools.Get(card, "Affliction");
-                    var savedProps = SavedNativeState(card);
-                    list.Add(new CardSnapshot(
-                        instanceId,
-                        (uint)ReflectionTools.Invoke(cardDb, "GetCardId", card)!,
-                        modelId,
-                        upgrades,
-                        resolvedCost,
-                        (bool)ReflectionTools.Get(cost, "CostsX")!,
-                        baseCost,
-                        retain,
-                        sly,
-                        exhaust,
-                        enchModel,
-                        enchAmount,
-                        savedProps,
-                        CaptureCardDynamicRuntime(card, "Card." + instanceId),
-                        affliction is null ? null : Entry(affliction),
-                        affliction is null ? 0 : Convert.ToInt32(ReflectionTools.Get(affliction, "Amount")),
-                        affliction is null ? null : SavedNativeState(affliction)
-                    ));
-                }
-                return list;
-            }
+            // Full card runtime is shared by pile members and explicit retired cards.
+            List<CardSnapshot> CapturePile(string name) => ReflectionTools.Enumerate(
+                ReflectionTools.Get(ReflectionTools.Get(_pcs, name)!, "Cards"))
+                .Where(c => c is not null).Select(c => CaptureNativeCardSnapshot(c!, cardDb)).ToList();
+            List<RetiredCardSnapshot> retiredCards = CaptureRetiredCards(cardDb);
+            List<string> registry = ReflectionTools.Enumerate(ReflectionTools.Get(_combat, "_allCards"))
+                .Select(c => GetCardInstanceId(c!)).ToList();
 
             // Powers on creature
             List<PowerSnapshot> CapturePowers(object ownerCreature)
@@ -4432,6 +4406,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 CapturePile("DiscardPile"),
                 CapturePile("ExhaustPile"),
                 CapturePile("PlayPile"),
+                retiredCards,
+                registry,
                 CapturePowers(playerCreature),
                 enemies,
                 relics,
@@ -4442,6 +4418,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 CaptureOstyEntity(CapturePowers),
                 CaptureCombatHistory()
             );
+            ValidateCombatCardDomain(captured);
+            ValidateRetiredDeckAliases(captured, _reset!);
             ValidateCombatHistory(captured);
             ValidateCardDynamicRuntimes(captured);
             return captured;
@@ -4462,11 +4440,12 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         try
         {
             object? residentOsty = ValidateOstyEntityBinding(snap);
+            ValidateCombatCardDomain(snap);
             ValidateCombatHistory(snap);
             ValidateCardDynamicRuntimes(snap);
+            Dictionary<string, object?> retiredDeckBindings = ResolveRetiredDeckBindings(snap);
             // XuShuxi: Reject ambiguous bindings before mutating any native state.
-            CardSnapshot[] residentCards = snap.Hand.Concat(snap.DrawPile).Concat(snap.DiscardPile)
-                .Concat(snap.ExhaustPile).Concat(snap.PlayPile).ToArray();
+            CardSnapshot[] residentCards = AllSnapshotCards(snap).ToArray();
             if (residentCards.Select(c => c.CombatCardId).Distinct().Count() != residentCards.Length
                 || residentCards.Select(c => c.InstanceId).Distinct(StringComparer.Ordinal).Count() != residentCards.Length
                 || residentCards.Any(c => string.IsNullOrWhiteSpace(c.InstanceId) || c.CombatCardId >= snap.NextCardId))
@@ -4517,9 +4496,9 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             IList combatAllCards = (IList)ReflectionTools.Get(_combat, "_allCards")!;
             combatAllCards.Clear();
 
-            void RestorePile(string pileName, List<CardSnapshot> cardSnaps)
+            // Phase one: hydrate every executable native card once, before binding history.
+            void RestoreCards(IEnumerable<CardSnapshot> cardSnaps)
             {
-                object pile = ReflectionTools.Get(_pcs, pileName)!;
                 foreach (CardSnapshot cs in cardSnaps)
                 {
                     object nativeCard;
@@ -4533,7 +4512,13 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                     }
 
                     ReflectionTools.Set(nativeCard, "_owner", _player);
-                    combatAllCards.Add(nativeCard);
+                    ReflectionTools.Set(nativeCard, "HasBeenRemovedFromState", cs.HasBeenRemovedFromState);
+                    if (retiredDeckBindings.TryGetValue(cs.InstanceId, out object? retiredDeck))
+                    {
+                        ReflectionTools.Set(nativeCard, "_deckVersion", retiredDeck);
+                        if (!ReferenceEquals(ReflectionTools.Get(nativeCard, "DeckVersion"), retiredDeck))
+                            throw RetiredCardError("RetiredCard." + cs.InstanceId, "Restored DeckVersion reference differs from the exact native reset alias.");
+                    }
 
                     ApplyNativeProperties(nativeCard, cs.SavedProperties);
                     if (cs.EnchantmentModelId is not null)
@@ -4569,16 +4554,11 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
 
                     RestoreCardDynamicRuntime(nativeCard, cs, "Card." + cs.InstanceId);
 
-                    ReflectionTools.Invoke(pile, "AddInternal", nativeCard, -1, true);
                     _cardInstanceIds[nativeCard] = cs.InstanceId;
                 }
             }
 
-            RestorePile("Hand", snap.Hand);
-            RestorePile("DrawPile", snap.DrawPile);
-            RestorePile("DiscardPile", snap.DiscardPile);
-            RestorePile("ExhaustPile", snap.ExhaustPile);
-            RestorePile("PlayPile", snap.PlayPile);
+            RestoreCards(residentCards);
 
             // XuShuxi: Preserve Construct's pile subscriptions, replacing only exact identity state.
             idToCard.Clear();
@@ -4591,6 +4571,21 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 cardToId.Add(restoredCard, card.CombatCardId);
             }
             ReflectionTools.Set(cardDb, "_nextId", snap.NextCardId);
+
+            // Phase two: restore actual source membership and order. No commands/hooks
+            // replay generating, playing or moving a card; retired cards never enter a pile.
+            foreach (string id in snap.CombatCardRegistry) combatAllCards.Add(restoredCards[id]);
+            void RestorePile(string name, IEnumerable<CardSnapshot> saved)
+            {
+                object pile = ReflectionTools.Get(_pcs, name)!;
+                foreach (CardSnapshot card in saved) ReflectionTools.Invoke(pile, "AddInternal", restoredCards[card.InstanceId], -1, true);
+            }
+            RestorePile("Hand", snap.Hand);
+            RestorePile("DrawPile", snap.DrawPile);
+            RestorePile("DiscardPile", snap.DiscardPile);
+            RestorePile("ExhaustPile", snap.ExhaustPile);
+            RestorePile("PlayPile", snap.PlayPile);
+
 
             // 4. Player powers
             RestoreCreaturePowers(playerCreature, snap.PlayerPowers);
@@ -4922,6 +4917,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         }
     }
 
+    [System.Text.Json.Serialization.JsonUnmappedMemberHandling(System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow)]
     private sealed record CardSnapshot(
         string InstanceId,
         uint CombatCardId,
@@ -4933,6 +4929,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         bool HasSingleTurnRetain,
         bool HasSingleTurnSly,
         bool ExhaustOnNextPlay,
+        [property: System.Text.Json.Serialization.JsonRequired] bool HasBeenRemovedFromState,
         string? EnchantmentModelId,
         decimal EnchantmentAmount,
         IReadOnlyDictionary<string, object?> SavedProperties,
@@ -5018,12 +5015,18 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     // XuShuxi: A resident/fallback public-hash match cannot stand in for private monster equality.
     private bool MonsterFingerprintMatches(CombatSnapshot expected)
     {
-        CombatSnapshot? actual = CaptureCombatSnapshot();
+        CombatSnapshot? actual;
+        try { actual = CaptureCombatSnapshot(); }
+        // An unsupported successor is not equal to a certified saved branch. It
+        // must not prevent restoring that earlier branch's exact known objects.
+        // Capture/export of the unsupported successor still rejects precisely.
+        catch (ProtocolException ex) when (ex.Code is "unsupported_retired_combat_card" or "unsupported_history_reference") { return false; }
         return actual is not null && JsonSerializer.Serialize(expected.Enemies, PortableRootJson)
             == JsonSerializer.Serialize(actual.Enemies, PortableRootJson)
             && OstyEntityFingerprintMatches(expected, actual)
             && CombatHistoryFingerprintMatches(expected, actual)
             && PlayerPowerRuntimeFingerprintMatches(expected, actual)
+            && CombatCardDomainFingerprintMatches(expected, actual)
             && CardDynamicRuntimeFingerprintMatches(expected, actual);
     }
 
@@ -5139,6 +5142,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         List<CardSnapshot> DiscardPile,
         List<CardSnapshot> ExhaustPile,
         List<CardSnapshot> PlayPile,
+        [property: System.Text.Json.Serialization.JsonRequired] List<RetiredCardSnapshot> RetiredCards,
+        [property: System.Text.Json.Serialization.JsonRequired] List<string> CombatCardRegistry,
         List<PowerSnapshot> PlayerPowers,
         List<EnemySnapshot> Enemies,
         List<RelicSnapshot> Relics,

@@ -109,6 +109,9 @@ public sealed partial class PersistentNativeCombatEnvironment
                 NextMove = ReflectionTools.Get(c!, "Monster") is { } monster ? Identity(ReflectionTools.Get(monster, "NextMove")) : 0
             }), Enemies = Members(ReflectionTools.Get(_combat!, "Enemies")), Potions = Members(ReflectionTools.Get(_player!, "PotionSlots")),
             Orbs = ReflectionTools.Get(_pcs!, "OrbQueue") is { } q ? Members(ReflectionTools.Get(q, "Orbs")) : null,
+            CardRegistry = Members(ReflectionTools.Get(_combat!, "_allCards")),
+            CardState = NativeCombatCardDomain().Select(c => new { Identity = Identity(c), Owner = Identity(ReflectionTools.Get(c, "Owner")),
+                DeckVersion = Identity(ReflectionTools.Get(c, "DeckVersion")), Removed = ReflectionTools.Get(c, "HasBeenRemovedFromState") }),
             Piles = new[] { "Hand", "DrawPile", "DiscardPile", "ExhaustPile", "PlayPile" }
                 .Select(pile => Members(ReflectionTools.Get(ReflectionTools.Get(_pcs!, pile)!, "Cards")))
         });
@@ -140,10 +143,7 @@ public sealed partial class PersistentNativeCombatEnvironment
         object history = NativeCombatHistory;
         var objects = new List<HistoryObject>();
         var identities = new Dictionary<object, int>(ReferenceEqualityComparer.Instance);
-        var cards = new HashSet<object>(ReferenceEqualityComparer.Instance);
-        foreach (string pile in new[] { "Hand", "DrawPile", "DiscardPile", "ExhaustPile", "PlayPile" })
-            foreach (object? card in ReflectionTools.Enumerate(ReflectionTools.Get(ReflectionTools.Get(_pcs!, pile)!, "Cards")))
-                if (card is not null) cards.Add(card);
+        var cards = NativeCombatCardDomain().ToHashSet(ReferenceEqualityComparer.Instance);
         object[] creatures = ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Creatures")).Cast<object>().ToArray();
         object[] players = ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Players")).Cast<object>().ToArray();
         var moveOwners = new Dictionary<object, object>(ReferenceEqualityComparer.Instance);
@@ -179,9 +179,7 @@ public sealed partial class PersistentNativeCombatEnvironment
             switch (kind)
             {
                 case "Card":
-                    if (!cards.Contains(value) || !ReferenceEquals(ReflectionTools.Get(value, "Owner"), _player)
-                        || Convert.ToBoolean(ReflectionTools.Get(value, "IsDupe")))
-                        throw HistoryReferenceError(path, $"Card {Entry(value)} is removed, foreign-owned, or a dupe outside the existing card codec.");
+                    ValidateNativeHistoryCard(value, cards, path);
                     binding = GetCardInstanceId(value); modelId = Entry(value); break;
                 case "Creature":
                     if (!creatures.Any(c => ReferenceEquals(c, value)))
@@ -438,7 +436,7 @@ public sealed partial class PersistentNativeCombatEnvironment
             ?? throw new ProtocolException("unsupported_combat_history", "An explicit shared history payload is required, including empty history.");
         if (saved.Version != CombatHistoryContractVersion || saved.ConsumerContract != HistoryConsumerContract || saved.Objects is null || saved.Entries is null)
             throw new ProtocolException("unsupported_combat_history", "History contract version/collections mismatch.");
-        var cards = snapshot.Hand.Concat(snapshot.DrawPile).Concat(snapshot.DiscardPile).Concat(snapshot.ExhaustPile).Concat(snapshot.PlayPile).ToDictionary(c => c.InstanceId);
+        var cards = AllSnapshotCards(snapshot).ToDictionary(c => c.InstanceId);
         foreach (PowerSnapshot power in snapshot.PlayerPowers.Concat(snapshot.Enemies.SelectMany(e => e.Powers))
             .Concat(snapshot.OstyEntity?.Entity?.Powers ?? []))
         {

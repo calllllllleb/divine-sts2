@@ -218,7 +218,7 @@ public sealed partial class PersistentNativeCombatEnvironment
     }
 
     private static IEnumerable<CardSnapshot> AllSnapshotCards(CombatSnapshot snapshot) => snapshot.Hand.Concat(snapshot.DrawPile)
-        .Concat(snapshot.DiscardPile).Concat(snapshot.ExhaustPile).Concat(snapshot.PlayPile);
+        .Concat(snapshot.DiscardPile).Concat(snapshot.ExhaustPile).Concat(snapshot.PlayPile).Concat(snapshot.RetiredCards.Select(r => r.Card));
     private void ValidateCardDynamicRuntimes(CombatSnapshot snapshot)
     {
         foreach (CardSnapshot card in AllSnapshotCards(snapshot)) ValidateCardDynamicRuntime(card, "Card." + card.InstanceId);
@@ -233,12 +233,9 @@ public sealed partial class PersistentNativeCombatEnvironment
         if (_runMode || _mapMode || _rewardMode || _restMode || _eventMode || _customRewardMode
             || _combat is null || _pcs is null || _player is null || _reset is null || !PlayerAlive() || !Alive("Enemies")) return null;
         object db = ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.GameActions.Multiplayer.NetCombatCardDb"), "Instance")!;
-        var cards = new List<object>();
-        foreach (string pile in new[] { "Hand", "DrawPile", "DiscardPile", "ExhaustPile", "PlayPile" })
-            foreach (object? card in ReflectionTools.Enumerate(ReflectionTools.Get(ReflectionTools.Get(_pcs, pile)!, "Cards")))
-                if (card is not null) cards.Add(new { InstanceId = GetCardInstanceId(card),
-                    CombatCardId = (uint)ReflectionTools.Invoke(db, "GetCardId", card)!,
-                    DynamicRuntime = CaptureCardDynamicRuntime(card, "Card." + GetCardInstanceId(card)) });
+        var cards = NativeCombatCardDomain().Select(card => new { InstanceId = GetCardInstanceId(card),
+            CombatCardId = (uint)ReflectionTools.Invoke(db, "GetCardId", card)!,
+            DynamicRuntime = CaptureCardDynamicRuntime(card, "Card." + GetCardInstanceId(card)) }).ToList();
         return JsonSerializer.Serialize(cards, PortableRootJson);
     }
 
