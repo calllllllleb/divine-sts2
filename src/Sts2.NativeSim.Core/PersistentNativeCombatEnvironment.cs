@@ -368,7 +368,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         ThrowIfPoisoned();
         EnsureReset();
         CombatSnapshot snapshot = CaptureCombatSnapshot()
-            ?? throw new ProtocolException("unsupported_combat_root", "An ordinary combat without pending native choice is required.");
+            ?? throw new ProtocolException("unsupported_combat_root", "An active ordinary combat without pending native choice is required.");
         EnvironmentResult current = Capture(null);
         return new(ProtocolConstants.CombatRootSchemaVersion, new(_productVersion, _assemblyHash, _pckHash), _reset!,
             JsonSerializer.SerializeToElement(snapshot, PortableRootJson), current.StateHash);
@@ -1175,6 +1175,16 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         QuiesceOutstandingTransition();
         Stopwatch timer = Stopwatch.StartNew();
         _pendingAnchor = null;
+        if ((branch.CombatSnapshot is not null || branch.PendingAnchor is not null)
+            && _combat is not null && (!PlayerAlive() || !Alive("Enemies")))
+        {
+            // Terminal cleanup tears down native FSMs. Recreate the original base,
+            // retain all branch handles, then apply the saved active snapshot directly.
+            // This performs no player action/history replay.
+            _reset = branch.Reset;
+            _cardInstanceIds.Clear(); _combatCreaturesById.Clear();
+            Construct(branch.Reset);
+        }
         if (branch.PendingAnchor is { } anchor)
         {
             // XuShuxi: Exact pre-action restore plus one native action creates a
@@ -4115,7 +4125,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             ["MegaCrit.Sts2.Core.MonsterMoves.Intents.StunIntent"]));
     }
 
-    private object BuildTransientMove(object creature, object monster, TransientMoveSnapshot descriptor)
+    private object BuildTransientMove(object creature, object monster, TransientMoveSnapshot descriptor, IReadOnlyList<object>? behaviorPowers = null)
     {
         if (!descriptor.MustPerformOnce)
             throw new ProtocolException("unsupported_transient_move", descriptor.MoveId);
@@ -4140,8 +4150,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             object owner = descriptor.BehaviorOwner switch
             {
                 "Monster" => monster,
-                "Power" when descriptor.PowerIndex is int index => ReflectionTools.Enumerate(ReflectionTools.Get(creature, "Powers"))
-                    .Where(power => power is not null).ElementAt(index)!,
+                "Power" when descriptor.PowerIndex is int index => behaviorPowers is not null ? behaviorPowers[index]
+                    : ReflectionTools.Enumerate(ReflectionTools.Get(creature, "Powers")).Where(power => power is not null).ElementAt(index)!,
                 _ => throw new ProtocolException("unsupported_transient_move", "Unknown runtime MoveState behavior owner.")
             };
             MethodInfo method = owner.GetType().GetMethod(descriptor.BehaviorMethod!,
@@ -4171,6 +4181,10 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         if (_runMode || _mapMode || _rewardMode || _restMode || _eventMode || _customRewardMode || _combat is null || _pcs is null || _player is null || _reset is null)
             return null;
         if (_pendingChoice is not null && !pendingMechanicsOnly)
+            return null;
+        // A decided battle has no future combat root. Keep its ordinary result/branch,
+        // without requiring removed combat objects to be portable continuation state.
+        if (!PlayerAlive() || !Alive("Enemies"))
             return null;
 
         bool oldSuppression = _suppressMonsterMoveEvents;
@@ -4416,6 +4430,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         {
             object? residentOsty = ValidateOstyEntityBinding(snap);
             ValidateCombatHistory(snap);
+            ValidateCombatHistoryBindings(snap);
             // XuShuxi: Reject ambiguous bindings before mutating any native state.
             CardSnapshot[] residentCards = snap.Hand.Concat(snap.DrawPile).Concat(snap.DiscardPile)
                 .Concat(snap.ExhaustPile).Concat(snap.PlayPile).ToArray();

@@ -1,4 +1,6 @@
 using System.Collections;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Sts2.NativeSim.Protocol;
@@ -8,15 +10,32 @@ namespace Sts2.NativeSim.Core;
 public sealed partial class PersistentNativeCombatEnvironment
 {
     // Internal reference numbers are local to this payload, never policy features.
-    private const int CombatHistoryContractVersion = 1;
+    private const int CombatHistoryContractVersion = 2;
     private const string HistoryEntryNamespace = "MegaCrit.Sts2.Core.Combat.History.Entries.";
     [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
     private sealed record CombatHistorySnapshot([property: JsonRequired] int Version,
+        [property: JsonRequired] uint PlayerCombatId, [property: JsonRequired] ulong PlayerNetId,
         [property: JsonRequired] List<HistoryObject> Objects, [property: JsonRequired] List<HistoryEntry> Entries);
     [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
     private sealed record HistoryObject([property: JsonRequired] string Kind, [property: JsonRequired] string NativeType,
         [property: JsonRequired] string? Binding, [property: JsonRequired] string? ModelId,
-        [property: JsonRequired] Dictionary<string, JsonElement> Fields, TransientMoveSnapshot? TransientMove = null);
+        [property: JsonRequired] Dictionary<string, JsonElement> Fields, TransientMoveSnapshot? TransientMove = null,
+        HistoricalPotion? Potion = null, HistoricalAffliction? Affliction = null, HistoricalDuplicationPower? Power = null);
+    [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+    private sealed record HistoricalPotion([property: JsonRequired] int? Owner,
+        [property: JsonRequired] bool IsQueued, [property: JsonRequired] bool HasBeenRemovedFromState,
+        [property: JsonRequired] bool DynamicVarsInitialized,
+        [property: JsonRequired] IReadOnlyDictionary<string, object?> SavedProperties);
+    [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+    private sealed record HistoricalAffliction([property: JsonRequired] int? Card,
+        [property: JsonRequired] int Amount, [property: JsonRequired] IReadOnlyDictionary<string, object?> SavedProperties);
+    [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+    private sealed record HistoricalDuplicationPower([property: JsonRequired] int? Owner,
+        [property: JsonRequired] int? Applier, [property: JsonRequired] int? Target,
+        [property: JsonRequired] int Amount, [property: JsonRequired] int AmountOnTurnStart,
+        [property: JsonRequired] bool SkipNextDurationTick, [property: JsonRequired] bool DynamicVarsInitialized,
+        [property: JsonRequired] string? ResolvedBigIconPath,
+        [property: JsonRequired] IReadOnlyDictionary<string, object?> SavedProperties);
     [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
     private sealed record HistoryEntry([property: JsonRequired] string Type, [property: JsonRequired] int? Actor,
         [property: JsonRequired] int RoundNumber, [property: JsonRequired] string CurrentSide,
@@ -85,6 +104,9 @@ public sealed partial class PersistentNativeCombatEnvironment
             objects.Add(new(kind, value.GetType().FullName!, null, null, new()));
             string? binding = null, modelId = null;
             TransientMoveSnapshot? transientMove = null;
+            HistoricalPotion? historicalPotion = null;
+            HistoricalAffliction? historicalAffliction = null;
+            HistoricalDuplicationPower? historicalPower = null;
             var fields = new Dictionary<string, JsonElement>();
             switch (kind)
             {
@@ -95,7 +117,10 @@ public sealed partial class PersistentNativeCombatEnvironment
                     binding = GetCardInstanceId(value); modelId = Entry(value); break;
                 case "Creature":
                     if (!creatures.Any(c => ReferenceEquals(c, value)))
-                        throw HistoryReferenceError(path, $"Creature {ReflectionTools.Get(value, "CombatId")} is removed from the supported combat snapshot.");
+                        throw HistoryReferenceError(path, $"Creature {ReflectionTools.Get(value, "CombatId")} is removed from the supported combat snapshot; "
+                            + $"native_in_progress={ReflectionTools.Get(_manager!, "IsInProgress")}, player_alive={PlayerAlive()}, "
+                            + "resident_enemies=" + string.Join(",", creatures.Where(c => ReflectionTools.Get(c, "Monster") is not null)
+                                .Select(c => $"{CreatureIdentity(c)}:{Entry(ReflectionTools.Get(c, "Monster")!)}:hp={ReflectionTools.Get(c, "CurrentHp")}")));
                     binding = CreatureIdentity(value).ToString(System.Globalization.CultureInfo.InvariantCulture); break;
                 case "Player":
                     if (!players.Any(p => ReferenceEquals(p, value))) throw HistoryReferenceError(path, "Player is outside this combat.");
@@ -105,11 +130,25 @@ public sealed partial class PersistentNativeCombatEnvironment
                     if (!creatures.Any(c => ReferenceEquals(c, creature))) throw HistoryReferenceError(path, "Removed monster.");
                     binding = CreatureIdentity(creature).ToString(System.Globalization.CultureInfo.InvariantCulture); modelId = Entry(value); break;
                 case "Power":
-                    object owner = ReflectionTools.Get(value, "Owner")!;
-                    int powerIndex = ReferenceIndex(ReflectionTools.Get(owner, "Powers"), value);
-                    if (!creatures.Any(c => ReferenceEquals(c, owner)) || powerIndex < 0)
-                        throw HistoryReferenceError(path, $"Power {Entry(value)} is history-only; no complete detached-power codec.");
-                    binding = $"{CreatureIdentity(owner)}/{powerIndex}"; modelId = Entry(value); break;
+                    object? owner = ReflectionTools.Get(value, "Owner");
+                    int powerIndex = ReferenceIndex(owner is null ? null : ReflectionTools.Get(owner, "Powers"), value);
+                    modelId = Entry(value);
+                    if (owner is not null && creatures.Any(c => ReferenceEquals(c, owner)) && powerIndex >= 0)
+                        binding = $"{CreatureIdentity(owner)}/{powerIndex}";
+                    else
+                    {
+                        ValidateHistoricalModelAbi(value, kind, path);
+                        object? powerVars = ReflectionTools.Get(value, "_dynamicVars");
+                        if (ReflectionTools.Get(value, "_internalData") is not null || powerVars is not null && ReflectionTools.Enumerate(powerVars).Count != 0)
+                            throw HistoryReferenceError(path, "DuplicationPower private data/nonempty variables require a separate codec.");
+                        historicalPower = new(Reference(owner, "Creature", path + ".Owner"),
+                            Reference(ReflectionTools.Get(value, "Applier"), "Creature", path + ".Applier"),
+                            Reference(ReflectionTools.Get(value, "Target"), "Creature", path + ".Target"),
+                            (int)ReflectionTools.Get(value, "Amount")!, (int)ReflectionTools.Get(value, "AmountOnTurnStart")!,
+                            (bool)ReflectionTools.Get(value, "SkipNextDurationTick")!, powerVars is not null,
+                            (string?)ReflectionTools.Get(value, "_resolvedBigIconPath"), SavedNativeState(value));
+                    }
+                    break;
                 case "Orb":
                     int orbIndex = ReferenceIndex(ReflectionTools.Get(ReflectionTools.Get(_pcs!, "OrbQueue")!, "Orbs"), value);
                     if (orbIndex < 0 || !ReferenceEquals(ReflectionTools.Get(value, "Owner"), _player))
@@ -117,13 +156,31 @@ public sealed partial class PersistentNativeCombatEnvironment
                     binding = orbIndex.ToString(System.Globalization.CultureInfo.InvariantCulture); modelId = Entry(value); break;
                 case "Potion":
                     int potionIndex = ReferenceIndex(ReflectionTools.Get(_player!, "PotionSlots"), value);
-                    if (potionIndex < 0) throw HistoryReferenceError(path, $"Potion {Entry(value)} has been consumed/removed; detached codec unavailable.");
-                    binding = potionIndex.ToString(System.Globalization.CultureInfo.InvariantCulture); modelId = Entry(value); break;
+                    modelId = Entry(value);
+                    if (potionIndex >= 0) binding = potionIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    else
+                    {
+                        ValidateHistoricalModelAbi(value, kind, path);
+                        object? vars = ReflectionTools.Get(value, "_dynamicVars");
+                        if (vars is not null && ReflectionTools.Enumerate(vars).Count != 0)
+                            throw HistoryReferenceError(path + "._dynamicVars", "Nonempty mutable potion variables have no existing history codec.");
+                        historicalPotion = new(Reference(ReflectionTools.Get(value, "Owner"), "Player", path + ".Owner"),
+                            (bool)ReflectionTools.Get(value, "IsQueued")!, (bool)ReflectionTools.Get(value, "HasBeenRemovedFromState")!,
+                            vars is not null, SavedNativeState(value));
+                    }
+                    break;
                 case "Affliction":
-                    object afflicted = ReflectionTools.Get(value, "Card")!;
-                    if (!cards.Contains(afflicted) || !ReferenceEquals(ReflectionTools.Get(afflicted, "Affliction"), value))
-                        throw HistoryReferenceError(path, $"Affliction {Entry(value)} is no longer attached to its supported card.");
-                    binding = GetCardInstanceId(afflicted); modelId = Entry(value); break;
+                    object? afflicted = ReflectionTools.Get(value, "Card");
+                    modelId = Entry(value);
+                    if (afflicted is not null && cards.Contains(afflicted) && ReferenceEquals(ReflectionTools.Get(afflicted, "Affliction"), value))
+                        binding = GetCardInstanceId(afflicted);
+                    else
+                    {
+                        ValidateHistoricalModelAbi(value, kind, path);
+                        historicalAffliction = new(Reference(afflicted, "Card", path + ".Card"),
+                            (int)ReflectionTools.Get(value, "Amount")!, SavedNativeState(value));
+                    }
+                    break;
                 case "Move":
                     var matches = creatures.Where(c => ReflectionTools.Get(c, "Monster") is { } m
                         && ReflectionTools.Enumerate(ReflectionTools.Get(ReflectionTools.Get(m, "MoveStateMachine")!, "States"))
@@ -155,7 +212,7 @@ public sealed partial class PersistentNativeCombatEnvironment
                     fields = CaptureFields(value, HistoryDamageFields, path); break;
                 default: throw HistoryReferenceError(path, $"Unknown object kind {kind}.");
             }
-            objects[id - 1] = new(kind, value.GetType().FullName!, binding, modelId, fields, transientMove);
+            objects[id - 1] = new(kind, value.GetType().FullName!, binding, modelId, fields, transientMove, historicalPotion, historicalAffliction, historicalPower);
             return id;
         }
         Dictionary<string, JsonElement> CaptureFields(object native, Dictionary<string, string> schema, string path)
@@ -191,8 +248,33 @@ public sealed partial class PersistentNativeCombatEnvironment
                 (int)ReflectionTools.Get(native, "RoundNumber")!, ReflectionTools.Get(native, "CurrentSide")!.ToString()!,
                 new((Dictionary<ulong, int>)ReflectionTools.Get(native, "_playerTurnNumbers")!), CaptureFields(native, schema, path)));
         }
-        return new(CombatHistoryContractVersion, objects, entries);
+        return new(CombatHistoryContractVersion, CreatureIdentity(ReflectionTools.Get(_player!, "Creature")!),
+            (ulong)ReflectionTools.Get(_player!, "NetId")!, objects, entries);
     }
+
+    private void ValidateHistoricalModelAbi(object model, string kind, string path)
+    {
+        if (kind == "Power" && (Entry(model) != "DUPLICATION_POWER"
+            || model.GetType().FullName != "MegaCrit.Sts2.Core.Models.Powers.DuplicationPower"))
+            throw HistoryReferenceError(path, $"Power {Entry(model)} is history-only; only the pinned DuplicationPower codec is supported.");
+        Type root = T("MegaCrit.Sts2.Core.Models." + kind + "Model");
+        string[] owned = kind == "Potion" ? ["_owner", "_dynamicVars", "_canonicalInstance", "<IsQueued>k__BackingField", "<HasBeenRemovedFromState>k__BackingField", "BeforeUse"]
+            : kind == "Power" ? ["_resolvedBigIconPath", "_amount", "_amountOnTurnStart", "_skipNextDurationTick", "_owner", "_applier", "_target", "_dynamicVars", "_internalData", "_canonicalInstance", "PulsingStarted", "PulsingStopped", "Flashed", "DisplayAmountChanged", "Removed"]
+            : ["_card", "_amount", "_canonicalInstance", "AmountChanged"];
+        foreach (FieldInfo field in root.GetFields(BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            if (!owned.Contains(field.Name, StringComparer.Ordinal))
+                throw HistoryReferenceError(path, $"Unclassified {kind} base member {field.Name}.");
+        // These families have bounded native value carriers, not an object-graph codec.
+        // Extra concrete mutable storage requires its own reviewed codec, even if default-valued.
+        for (Type? type = model.GetType(); type is not null && type != root; type = type.BaseType)
+            foreach (FieldInfo field in type.GetFields(BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                if (!field.IsInitOnly && !field.IsLiteral)
+                    throw HistoryReferenceError(path + "." + field.Name, "Concrete model storage is outside the historical Potion/Affliction codec.");
+    }
+
+    private object MutableHistoricalModel(HistoryObject o) => o.Kind == "Power"
+        ? ReflectionTools.Invoke(Find(ReflectionTools.GetStatic(T("MegaCrit.Sts2.Core.Models.ModelDb"), "AllPowers")!, o.ModelId!), "ToMutable", 0)!
+        : Mutable(o.Kind == "Potion" ? "AllPotions" : "DebugAfflictions", o.ModelId!);
 
     private static int ReferenceIndex(object? sequence, object target)
     {
@@ -210,9 +292,11 @@ public sealed partial class PersistentNativeCombatEnvironment
         var cards = snapshot.Hand.Concat(snapshot.DrawPile).Concat(snapshot.DiscardPile).Concat(snapshot.ExhaustPile).Concat(snapshot.PlayPile).ToDictionary(c => c.InstanceId);
         var creatureIds = snapshot.Enemies.Select(e => e.CombatId).ToHashSet();
         if (snapshot.OstyEntity?.Entity is { } osty) creatureIds.Add(osty.CombatId);
-        // Native single-player initialization always uses this actual player binding.
-        uint playerId = _player is null ? 0 : CreatureIdentity(ReflectionTools.Get(_player, "Creature")!);
-        ulong netId = _player is null ? 1 : (ulong)ReflectionTools.Get(_player, "NetId")!;
+        // Descriptor-only: never inspect the destination worker's previous combat.
+        uint playerId = saved.PlayerCombatId;
+        ulong netId = saved.PlayerNetId;
+        if (playerId != 0 || netId != 1 || creatureIds.Contains(playerId))
+            throw new ProtocolException("invalid_combat_history", "History player binding is outside the pinned single-player initialization profile.");
         creatureIds.Add(playerId);
         List<PowerSnapshot>? Powers(uint id) => id == playerId ? snapshot.PlayerPowers
             : snapshot.OstyEntity?.Entity is { } pet && pet.CombatId == id ? pet.Powers
@@ -257,7 +341,10 @@ public sealed partial class PersistentNativeCombatEnvironment
             for (int i = 0; i < saved.Objects.Count; i++)
             {
                 HistoryObject o = saved.Objects[i]; string path = $"History.Objects[{i + 1}]";
-                if (o is null || o.Fields is null || o.Kind != "Move" && o.TransientMove is not null) throw new ProtocolException("invalid_combat_history", path);
+                if (o is null || o.Fields is null || o.Kind != "Move" && o.TransientMove is not null
+                    || o.Kind != "Potion" && o.Potion is not null || o.Kind != "Affliction" && o.Affliction is not null
+                    || o.Kind != "Power" && o.Power is not null)
+                    throw new ProtocolException("invalid_combat_history", path);
                 if (o.Kind is "CardPlay" or "DamageResult")
                 {
                     string type = o.Kind == "CardPlay" ? "MegaCrit.Sts2.Core.Entities.Cards.CardPlay" : "MegaCrit.Sts2.Core.Entities.Creatures.DamageResult";
@@ -265,6 +352,39 @@ public sealed partial class PersistentNativeCombatEnvironment
                     Fields(o.Fields, o.Kind == "CardPlay" ? HistoryCardPlayFields : HistoryDamageFields, path);
                     if (o.Kind == "CardPlay" && (o.Fields["PlayCount"].GetInt32() < 1 || o.Fields["PlayIndex"].GetInt32() < 0 || o.Fields["PlayIndex"].GetInt32() >= o.Fields["PlayCount"].GetInt32()))
                         throw new ProtocolException("invalid_combat_history", path + ": invalid replay series.");
+                    continue;
+                }
+                if (o.Potion is not null || o.Affliction is not null || o.Power is not null)
+                {
+                    if (o.Binding is not null || o.Fields.Count != 0 || o.TransientMove is not null || o.ModelId is null)
+                        throw new ProtocolException("invalid_combat_history", path + ": resident and historical forms are mutually exclusive.");
+                    object model = MutableHistoricalModel(o);
+                    if (model.GetType().FullName != o.NativeType) throw new ProtocolException("invalid_combat_history", path + ": model/type mismatch.");
+                    ValidateHistoricalModelAbi(model, o.Kind, path);
+                    if (o.Potion is { } potion)
+                    {
+                        Ref(JsonSerializer.SerializeToElement(potion.Owner), "Player", true, path + ".Potion.Owner");
+                        if (potion.SavedProperties is null) throw new ProtocolException("invalid_combat_history", path);
+                        ApplyNativeProperties(model, potion.SavedProperties);
+                        if (potion.DynamicVarsInitialized && ReflectionTools.Enumerate(ReflectionTools.Get(model, "DynamicVars")).Count != 0)
+                            throw HistoryReferenceError(path + ".Potion.DynamicVars", "Nonempty variables require a separate codec.");
+                    }
+                    else if (o.Affliction is { } affliction)
+                    {
+                        Ref(JsonSerializer.SerializeToElement(affliction.Card), "Card", true, path + ".Affliction.Card");
+                        if (affliction.SavedProperties is null) throw new ProtocolException("invalid_combat_history", path);
+                        ApplyNativeProperties(model, affliction.SavedProperties);
+                    }
+                    else if (o.Power is { } power)
+                    {
+                        Ref(JsonSerializer.SerializeToElement(power.Owner), "Creature", true, path + ".Power.Owner");
+                        Ref(JsonSerializer.SerializeToElement(power.Applier), "Creature", true, path + ".Power.Applier");
+                        Ref(JsonSerializer.SerializeToElement(power.Target), "Creature", true, path + ".Power.Target");
+                        if (power.SavedProperties is null) throw new ProtocolException("invalid_combat_history", path);
+                        ApplyNativeProperties(model, power.SavedProperties);
+                        if (ReflectionTools.Get(model, "_internalData") is not null || ReflectionTools.Enumerate(ReflectionTools.Get(model, "DynamicVars")).Count != 0)
+                            throw HistoryReferenceError(path + ".Power", "Private data/nonempty variables require a separate codec.");
+                    }
                     continue;
                 }
                 if (o.Binding is null || o.Fields.Count != 0 || o.TransientMove is null && !bindings.Add(o.Kind + ":" + o.Binding))
@@ -285,10 +405,26 @@ public sealed partial class PersistentNativeCombatEnvironment
                     case "Affliction": valid = cards.TryGetValue(o.Binding, out var afflicted) && afflicted.AfflictionModelId == o.ModelId; break;
                     case "Move":
                         string[] moveParts = o.Binding.Split('/', 2);
-                        valid = moveParts.Length == 2 && uint.TryParse(moveParts[0], out uint monster) && creatureIds.Contains(monster) && o.ModelId is null;
+                        uint monster = 0;
+                        valid = moveParts.Length == 2 && uint.TryParse(moveParts[0], out monster) && creatureIds.Contains(monster) && o.ModelId is null;
                         if (o.TransientMove is { } transient && (moveParts.Length != 2 || transient.MoveId != moveParts[1]))
                             valid = false;
-                        if (valid && _combat is not null) _ = BindHistoryObject(o); // FSM state ABI preflight before live mutation.
+                        if (o.NativeType != "MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState") valid = false;
+                        if (valid && o.TransientMove is { } descriptor)
+                        {
+                            if (!descriptor.MustPerformOnce || string.IsNullOrWhiteSpace(descriptor.FollowUpStateId)
+                                || descriptor.IntentTypeNames is not { Length: > 0 }) valid = false;
+                            if (descriptor.BehaviorOwner == "Power")
+                            {
+                                if (descriptor.PowerIndex is not int pi || Powers(monster) is not { } sourcePowers || pi < 0 || pi >= sourcePowers.Count) valid = false;
+                                else ApplyNativeProperties(Mutable("AllPowers", sourcePowers[pi].ModelId), sourcePowers[pi].SavedProperties);
+                            }
+                            else if (descriptor.BehaviorOwner is not ("Monster" or "NoOp")) valid = false;
+                            if (descriptor.BehaviorOwner == "NoOp" && (descriptor.BehaviorMethod is not null || descriptor.PowerIndex is not null)) valid = false;
+                            if (descriptor.BehaviorOwner != "NoOp" && string.IsNullOrWhiteSpace(descriptor.BehaviorMethod)) valid = false;
+                            foreach (string intent in descriptor.IntentTypeNames ?? [])
+                                if (!T("MegaCrit.Sts2.Core.MonsterMoves.Intents.AbstractIntent").IsAssignableFrom(T(intent))) valid = false;
+                        }
                         break;
                     default: throw new ProtocolException("unsupported_history_reference", path + ": unknown kind " + o.Kind);
                 }
@@ -328,6 +464,39 @@ public sealed partial class PersistentNativeCombatEnvironment
         catch (Exception ex) { throw new ProtocolException("invalid_combat_history", "Invalid history descriptor: " + ex.Message); }
     }
 
+    private void ValidateCombatHistoryBindings(CombatSnapshot snapshot)
+    {
+        CombatHistorySnapshot saved = snapshot.CombatHistory!;
+        if (CreatureIdentity(ReflectionTools.Get(_player!, "Creature")!) != saved.PlayerCombatId
+            || (ulong)ReflectionTools.Get(_player!, "NetId")! != saved.PlayerNetId)
+            throw HistoryReferenceError("History.Player", "Restoration base does not match the descriptor player.");
+        foreach (HistoryObject move in saved.Objects.Where(o => o.Kind == "Move"))
+        {
+            uint id = uint.Parse(move.Binding!.Split('/')[0]);
+            object creature = ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Creatures"))
+                .SingleOrDefault(c => c is not null && CreatureIdentity(c) == id)
+                ?? throw HistoryReferenceError(move.Binding!, "Move owner is absent from the restoration base.");
+            object monster = ReflectionTools.Get(creature, "Monster")!;
+            string? modelId = snapshot.Enemies.SingleOrDefault(e => e.CombatId == id)?.ModelId
+                ?? (snapshot.OstyEntity?.Entity is { } pet && pet.CombatId == id ? pet.ModelId : null);
+            if (modelId is null || Entry(monster) != modelId) throw HistoryReferenceError(move.Binding!, "Move owner model differs from the saved state.");
+            if (move.TransientMove is { } transient)
+            {
+                List<PowerSnapshot> powers = snapshot.Enemies.SingleOrDefault(e => e.CombatId == id)?.Powers
+                    ?? snapshot.OstyEntity!.Entity!.Powers;
+                object[] detached = powers.Select(power =>
+                {
+                    object value = Mutable("AllPowers", power.ModelId);
+                    ReflectionTools.Set(value, "_amount", power.Amount);
+                    ApplyNativeProperties(value, power.SavedProperties);
+                    return value;
+                }).ToArray();
+                _ = BuildTransientMove(creature, monster, transient, detached);
+            }
+            else _ = BindHistoryObject(move);
+        }
+    }
+
     private object BindHistoryObject(HistoryObject saved)
     {
         object Creature(uint id) => ReflectionTools.Enumerate(ReflectionTools.Get(_combat!, "Creatures"))
@@ -362,11 +531,46 @@ public sealed partial class PersistentNativeCombatEnvironment
         object? Ref(JsonElement value) => value.ValueKind == JsonValueKind.Null ? null : objects[value.GetInt32() - 1];
         // Resident objects first, then non-effect record objects; sharing uses the same table slot.
         for (int i = 0; i < saved.Objects.Count; i++)
-            if (saved.Objects[i].Kind is not ("CardPlay" or "DamageResult")) objects[i] = BindHistoryObject(saved.Objects[i]);
+            if (saved.Objects[i].Kind is not ("CardPlay" or "DamageResult") && saved.Objects[i].Potion is null && saved.Objects[i].Affliction is null && saved.Objects[i].Power is null)
+                objects[i] = BindHistoryObject(saved.Objects[i]);
         for (int i = 0; i < saved.Objects.Count; i++)
         {
             HistoryObject o = saved.Objects[i]; var f = o.Fields;
-            if (o.Kind == "CardPlay")
+            if (o.Potion is { } potion)
+            {
+                object model = MutableHistoricalModel(o);
+                ApplyNativeProperties(model, potion.SavedProperties);
+                ReflectionTools.Set(model, "_owner", potion.Owner is int owner ? objects[owner - 1] : null);
+                ReflectionTools.Set(model, "IsQueued", potion.IsQueued);
+                ReflectionTools.Set(model, "HasBeenRemovedFromState", potion.HasBeenRemovedFromState);
+                ReflectionTools.Set(model, "_dynamicVars", null);
+                if (potion.DynamicVarsInitialized) _ = ReflectionTools.Get(model, "DynamicVars");
+                objects[i] = model;
+            }
+            else if (o.Affliction is { } affliction)
+            {
+                object model = MutableHistoricalModel(o);
+                ApplyNativeProperties(model, affliction.SavedProperties);
+                ReflectionTools.Set(model, "_card", affliction.Card is int card ? objects[card - 1] : null);
+                ReflectionTools.Set(model, "_amount", affliction.Amount);
+                objects[i] = model;
+            }
+            else if (o.Power is { } power)
+            {
+                object model = MutableHistoricalModel(o);
+                ApplyNativeProperties(model, power.SavedProperties);
+                ReflectionTools.Set(model, "_owner", power.Owner is int owner ? objects[owner - 1] : null);
+                ReflectionTools.Set(model, "_applier", power.Applier is int applier ? objects[applier - 1] : null);
+                ReflectionTools.Set(model, "_target", power.Target is int target ? objects[target - 1] : null);
+                ReflectionTools.Set(model, "_amount", power.Amount);
+                ReflectionTools.Set(model, "_amountOnTurnStart", power.AmountOnTurnStart);
+                ReflectionTools.Set(model, "_skipNextDurationTick", power.SkipNextDurationTick);
+                ReflectionTools.Set(model, "_resolvedBigIconPath", power.ResolvedBigIconPath);
+                if (power.DynamicVarsInitialized) _ = ReflectionTools.Get(model, "DynamicVars");
+                else ReflectionTools.Set(model, "_dynamicVars", null);
+                objects[i] = model;
+            }
+            else if (o.Kind == "CardPlay")
             {
                 object resources = Activator.CreateInstance(T("MegaCrit.Sts2.Core.Entities.Cards.ResourceInfo"))!;
                 foreach (string field in new[] { "EnergySpent", "EnergyValue", "StarsSpent", "StarValue" }) ReflectionTools.Set(resources, field, f[field].GetInt32());
@@ -414,7 +618,20 @@ public sealed partial class PersistentNativeCombatEnvironment
             };
             object side = Enum.Parse(T("MegaCrit.Sts2.Core.Combat.CombatSide"), e.CurrentSide);
             object?[] suffix = e.Type == "CardDrawnEntry" ? [e.RoundNumber, side, f["FromHandDraw"].GetBoolean(), history, players] : [e.RoundNumber, side, history, players];
-            object entry = ReflectionTools.Create(T(HistoryEntryNamespace + e.Type), prefix.Concat(suffix).ToArray());
+            object entry;
+            if (e.Type == "PotionUsedEntry" && ReflectionTools.Get(R("Potion")!, "Owner") is null)
+            {
+                // Native constructor infers Actor from Owner. A subsequently cleared Owner
+                // needs direct hydration of this fully enumerated native record, not a fake owner.
+                entry = RuntimeHelpers.GetUninitializedObject(T(HistoryEntryNamespace + e.Type));
+                ReflectionTools.Set(entry, "<Potion>k__BackingField", R("Potion"));
+                ReflectionTools.Set(entry, "<Target>k__BackingField", R("Target"));
+                ReflectionTools.Set(entry, "<RoundNumber>k__BackingField", e.RoundNumber);
+                ReflectionTools.Set(entry, "<CurrentSide>k__BackingField", side);
+                ReflectionTools.Set(entry, "<History>k__BackingField", history);
+                ReflectionTools.Set(entry, "_playerTurnNumbers", new Dictionary<ulong, int>());
+            }
+            else entry = ReflectionTools.Create(T(HistoryEntryNamespace + e.Type), prefix.Concat(suffix).ToArray());
             // Constructors infer current owners/turns; historical values must win.
             ReflectionTools.Set(entry, "<Actor>k__BackingField", actor);
             var turns = (Dictionary<ulong, int>)ReflectionTools.Get(entry, "_playerTurnNumbers")!; turns.Clear();
