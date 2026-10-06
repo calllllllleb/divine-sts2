@@ -368,15 +368,15 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         CombatSnapshot snapshot = CaptureCombatSnapshot()
             ?? throw new ProtocolException("unsupported_combat_root", "An ordinary combat without pending native choice is required.");
         EnvironmentResult current = Capture(null);
-        return new(1, new(_productVersion, _assemblyHash, _pckHash), _reset!,
+        return new(ProtocolConstants.CombatRootSchemaVersion, new(_productVersion, _assemblyHash, _pckHash), _reset!,
             JsonSerializer.SerializeToElement(snapshot, PortableRootJson), current.StateHash);
     }
 
     public EnvironmentResult ImportCombatRoot(PortableCombatRoot root)
     {
         ThrowIfPoisoned();
-        if (root.SchemaVersion != 1)
-            throw new ProtocolException("unsupported_combat_root_schema", $"Expected schema 1, obtained {root.SchemaVersion}.");
+        if (root.SchemaVersion != ProtocolConstants.CombatRootSchemaVersion)
+            throw new ProtocolException("unsupported_combat_root_schema", $"Expected schema {ProtocolConstants.CombatRootSchemaVersion}, obtained {root.SchemaVersion}.");
         if (root.GameBuild is null || root.GameBuild.Version != _productVersion
             || root.GameBuild.AssemblySha256 != _assemblyHash || root.GameBuild.PckSha256 != _pckHash)
             throw new ProtocolException("build_mismatch", "Portable roots require the exact game build identity.");
@@ -384,6 +384,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             throw new ProtocolException("invalid_combat_root", "A base reset and expected state hash are required.");
         CombatSnapshot snapshot = root.CombatSnapshot.Deserialize<CombatSnapshot>(PortableRootJson)
             ?? throw new ProtocolException("invalid_combat_root", "Missing combat snapshot.");
+        ValidateOstyEntityDescriptor(snapshot);
         foreach (EnemySnapshot enemy in snapshot.Enemies)
             if (enemy.MonsterRuntimeState is null)
                 throw new ProtocolException("unsupported_combat_root", "Missing exact monster runtime payload.");
@@ -406,6 +407,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             ?? throw new ProtocolException("unsupported_combat_root", "Imported root is not quiescent.");
         if (JsonSerializer.Serialize(snapshot.Enemies, PortableRootJson) != JsonSerializer.Serialize(actual.Enemies, PortableRootJson))
             throw new ProtocolException("combat_root_monster_mismatch", "Imported monster runtime fingerprint differs.");
+        if (!OstyEntityFingerprintMatches(snapshot, actual))
+            throw new ProtocolException("combat_root_osty_entity_mismatch", "Imported Osty entity fingerprint differs.");
         timer.Stop();
         return imported with { Transition = new { kind = "portable_combat_root_import", replayed_actions = 0, elapsed_ms = timer.Elapsed.TotalMilliseconds } };
     }
@@ -4379,7 +4382,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 potions,
                 orbQueueSnapshot,
                 (string)ReflectionTools.Get(ReflectionTools.Get(_run!, "Rng")!, "StringSeed")!,
-                PublicRunOddsSnapshot()
+                PublicRunOddsSnapshot(),
+                CaptureOstyEntity(CapturePowers)
             );
         }
         catch (ProtocolException) { throw; }
@@ -4397,6 +4401,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
 
         try
         {
+            object? residentOsty = ValidateOstyEntityBinding(snap);
             // XuShuxi: Reject ambiguous bindings before mutating any native state.
             CardSnapshot[] residentCards = snap.Hand.Concat(snap.DrawPile).Concat(snap.DiscardPile)
                 .Concat(snap.ExhaustPile).Concat(snap.PlayPile).ToArray();
@@ -4521,6 +4526,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
 
             // 4. Player powers
             RestoreCreaturePowers(playerCreature, snap.PlayerPowers);
+            RestoreOstyEntity(residentOsty, snap.OstyEntity!.Entity);
 
             // 5. Relics
             foreach (RelicSnapshot rs in snap.Relics)
@@ -4667,11 +4673,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
             }
 
             // XuShuxi: Rebuild identity mappings after temporary CreateCreature IDs are replaced.
-            _combatCreaturesById.Clear();
-            object restoredPlayer = ReflectionTools.Get(_player!, "Creature")!;
-            _combatCreaturesById[Convert.ToUInt32(ReflectionTools.Get(restoredPlayer, "CombatId"))] = restoredPlayer;
-            foreach (object restoredEnemy in combatEnemies)
-                _combatCreaturesById[Convert.ToUInt32(ReflectionTools.Get(restoredEnemy, "CombatId"))] = restoredEnemy;
+            RebuildCombatCreatureIdentities();
 
             // 9. RNG stream counters
             string desiredSeed = snap.RunRngStringSeed ?? _reset!.Seed;
@@ -4689,7 +4691,7 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
                 ?? throw new ProtocolException("unsupported_monster_rng_owner", "Missing MonsterModel._runRng.");
             if (owner.FieldType != runRngType || owner.IsInitOnly)
                 throw new ProtocolException("unsupported_monster_rng_owner", "MonsterModel._runRng ABI mismatch.");
-            foreach (object? creature in ReflectionTools.Enumerate(ReflectionTools.Get(_combat, "Enemies")))
+            foreach (object? creature in ReflectionTools.Enumerate(ReflectionTools.Get(_combat, "Creatures")))
                 if (creature is not null && ReflectionTools.Get(creature, "Monster") is { } monster)
                 {
                     owner.SetValue(monster, runRng);
@@ -4880,7 +4882,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
     {
         CombatSnapshot? actual = CaptureCombatSnapshot();
         return actual is not null && JsonSerializer.Serialize(expected.Enemies, PortableRootJson)
-            == JsonSerializer.Serialize(actual.Enemies, PortableRootJson);
+            == JsonSerializer.Serialize(actual.Enemies, PortableRootJson)
+            && OstyEntityFingerprintMatches(expected, actual);
     }
 
     private List<MonsterRuntimeEntry> CaptureMonsterRuntimeState(object monster)
@@ -4999,7 +5002,8 @@ public sealed partial class PersistentNativeCombatEnvironment : IDisposable
         List<string?> PotionSlots,
         OrbQueueSnapshot? Orbs,
         string? RunRngStringSeed = null,
-        JsonElement? PublicRunOdds = null);
+        JsonElement? PublicRunOdds = null,
+        OstyEntityPayload? OstyEntity = null);
 
     private sealed record Branch(
         string? ParentHandle,
